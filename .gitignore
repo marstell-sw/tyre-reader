@@ -8,6 +8,8 @@ out-smoke-abs/
 out-smoke-db/
 output/
 analysis_batch/
+analysis_wheel/
+analysis_wheel_one/
 *.deb
 tessdata/
 _tmp_tess_pkg/

@@ -106,28 +106,54 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
         saveDebugImage(gray, (fs::path(debugDir) / "01_gray.png").string());
     }
 
-    const Clock::time_point deskewStart = Clock::now();
-    const cv::Mat deskewed = preprocessor_.deskewLight(gray);
-    appendTiming(result.stepTimings, "preprocess_deskew_ms", elapsedMs(deskewStart, Clock::now()));
-    if (saveDebugArtifacts_) {
-        saveDebugImage(deskewed, (fs::path(debugDir) / "02_deskew.png").string());
-    }
-
     const Clock::time_point claheStart = Clock::now();
-    const cv::Mat deskewClahe = preprocessor_.applyClahe(deskewed);
+    const cv::Mat grayClahe = preprocessor_.applyClahe(gray);
     appendTiming(result.stepTimings, "preprocess_clahe_ms", elapsedMs(claheStart, Clock::now()));
     if (saveDebugArtifacts_) {
-        saveDebugImage(deskewClahe, (fs::path(debugDir) / "03_deskew_clahe.png").string());
+        saveDebugImage(grayClahe, (fs::path(debugDir) / "02_gray_clahe.png").string());
+    }
+
+    const Clock::time_point wheelStart = Clock::now();
+    ImagePreprocessor::WheelDebugImages wheelDebugImages;
+    const ImagePreprocessor::WheelGeometry wheelGeometry =
+        preprocessor_.detectWheelGeometry(frame, saveDebugArtifacts_ ? &wheelDebugImages : nullptr, &result.stepTimings);
+    appendTiming(result.stepTimings, "wheel_total_ms", elapsedMs(wheelStart, Clock::now()));
+    if (saveDebugArtifacts_) {
+        saveDebugImage(wheelDebugImages.gray, (fs::path(debugDir) / "03_wheel_gray.png").string());
+        saveDebugImage(wheelDebugImages.blurred, (fs::path(debugDir) / "04_wheel_blurred.png").string());
+        saveDebugImage(wheelDebugImages.circlesOverlay, (fs::path(debugDir) / "05_wheel_circles.png").string());
+        saveDebugImage(wheelDebugImages.annulusOverlay, (fs::path(debugDir) / "06_wheel_annulus.png").string());
     }
     result.timings.preprocessMs = elapsedMs(grayStart, Clock::now());
+
+    cv::Mat ocrSource = frame;
+    if (wheelGeometry.found) {
+        const Clock::time_point unwrapStart = Clock::now();
+        cv::Mat sidewallBand =
+            preprocessor_.unwrapSidewallBand(frame, wheelGeometry, saveDebugArtifacts_ ? &wheelDebugImages : nullptr, &result.stepTimings);
+        appendTiming(result.stepTimings, "wheel_unwrap_total_ms", elapsedMs(unwrapStart, Clock::now()));
+        if (!sidewallBand.empty()) {
+            ocrSource = sidewallBand;
+            result.notes.push_back("Using unwrapped sidewall band for OCR.");
+        } else {
+            result.notes.push_back("Wheel detected, but sidewall unwrap failed. Falling back to full image.");
+        }
+        if (saveDebugArtifacts_) {
+            saveDebugImage(wheelDebugImages.polarFull, (fs::path(debugDir) / "07_polar_full.png").string());
+            saveDebugImage(wheelDebugImages.sidewallBand, (fs::path(debugDir) / "08_sidewall_band.png").string());
+        }
+    } else {
+        result.notes.push_back("Wheel circle not detected. Falling back to full image.");
+    }
 
     const Clock::time_point roiStart = Clock::now();
     ImagePreprocessor::RoiDebugImages roiDebugImages;
     std::vector<cv::Rect> overlayBoxes;
     const std::vector<CandidateRoi> rois =
-        preprocessor_.proposeTextRegions(frame, saveDebugArtifacts_ ? &roiDebugImages : nullptr, &result.stepTimings);
+        preprocessor_.proposeTextRegions(ocrSource, saveDebugArtifacts_ ? &roiDebugImages : nullptr, &result.stepTimings);
     result.timings.roiProposalMs = elapsedMs(roiStart, Clock::now());
     if (saveDebugArtifacts_) {
+        saveDebugImage(ocrSource, (fs::path(debugDir) / "09_ocr_source.png").string());
         saveDebugImage(roiDebugImages.gray, (fs::path(debugDir) / "10_roi_gray.png").string());
         saveDebugImage(roiDebugImages.clahe, (fs::path(debugDir) / "11_roi_clahe.png").string());
         saveDebugImage(roiDebugImages.denoised, (fs::path(debugDir) / "12_roi_denoised.png").string());
@@ -141,7 +167,7 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
 
     const Clock::time_point ocrStart = Clock::now();
     const std::vector<CandidateText> candidateTexts =
-        collectCandidateTexts(frame, rois, debugDir, result, overlayBoxes);
+        collectCandidateTexts(ocrSource, rois, debugDir, result, overlayBoxes);
     result.timings.ocrMs = elapsedMs(ocrStart, Clock::now());
 
     const Clock::time_point parsingStart = Clock::now();
@@ -192,14 +218,14 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     }
 
     const Clock::time_point cropStart = Clock::now();
-    saveCropOrPlaceholder(frame, result.tyreSize.boundingBox, sizeCropPath, "SIZE ROI NOT FOUND", result.tyreSizeFound);
-    saveCropOrPlaceholder(frame, result.dot.boundingBox, dotCropPath, "DOT ROI NOT FOUND", result.dotFound);
+    saveCropOrPlaceholder(ocrSource, result.tyreSize.boundingBox, sizeCropPath, "SIZE ROI NOT FOUND", result.tyreSizeFound);
+    saveCropOrPlaceholder(ocrSource, result.dot.boundingBox, dotCropPath, "DOT ROI NOT FOUND", result.dotFound);
     result.tyreSize.cropPath = sizeCropPath;
     result.dot.cropPath = dotCropPath;
     result.timings.cropSaveMs = elapsedMs(cropStart, Clock::now());
 
     const Clock::time_point overlayStart = Clock::now();
-    saveOverlay(frame, overlayBoxes, result.tyreSize.boundingBox, result.dot.boundingBox, overlayPath);
+    saveOverlay(ocrSource, overlayBoxes, result.tyreSize.boundingBox, result.dot.boundingBox, overlayPath);
     result.overlayPath = overlayPath;
     result.timings.overlaySaveMs = elapsedMs(overlayStart, Clock::now());
 
@@ -207,6 +233,9 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     appendTiming(result.stepTimings, "total_ms", result.timings.totalMs);
     if (saveDebugArtifacts_) {
         cv::Mat roiOverlay = frame.clone();
+        if (ocrSource.size() != frame.size() || ocrSource.type() != frame.type()) {
+            roiOverlay = ocrSource.clone();
+        }
         for (std::size_t index = 0; index < rois.size(); ++index) {
             cv::rectangle(roiOverlay, rois[index].box, cv::Scalar(255, 200, 0), 2);
             cv::putText(roiOverlay, std::to_string(index), rois[index].box.tl() + cv::Point(0, -4),
@@ -451,7 +480,7 @@ std::vector<TyreAnalyzer::CandidateText> TyreAnalyzer::collectCandidateTexts(
         }
 
         const double aspectRatio = static_cast<double>(bounded.width) / std::max(1, bounded.height);
-        if (aspectRatio < 1.2 || aspectRatio > 25.0) {
+        if (aspectRatio < 1.2 || aspectRatio > 80.0) {
             continue;
         }
 
@@ -479,7 +508,7 @@ std::vector<TyreAnalyzer::CandidateText> TyreAnalyzer::collectCandidateTexts(
             resultItem.variantName = "block:" + resultItem.variantName;
         }
         tesseractMs += elapsedMs(blockOcrStart, Clock::now());
-        if (aspectRatio >= 4.0 && roi.imageQualityScore >= 0.20) {
+        if (aspectRatio >= 4.0 && roi.imageQualityScore >= 0.12) {
             const Clock::time_point lineOcrStart = Clock::now();
             std::vector<OcrResult> lineResults = ocrEngine_.recognizeVariants(variants, tesseract::PSM_SINGLE_LINE);
             for (auto& resultItem : lineResults) {
