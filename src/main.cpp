@@ -2,7 +2,9 @@
 #include "TyreAnalyzer.h"
 #include "Types.h"
 
+#include <filesystem>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -156,6 +158,25 @@ std::string analysisArrayToJson(const std::vector<AnalysisResult>& results, bool
     return json;
 }
 
+std::string wheelExtractionResultToJson(const WheelExtractionResult& result, bool pretty, int level = 0) {
+    const std::string i0 = pretty ? indent(level) : "";
+    const std::string i1 = pretty ? indent(level + 1) : "";
+    const std::string nl = pretty ? "\n" : "";
+    const std::string sep = pretty ? " " : "";
+
+    std::string json = i0 + "{" + nl;
+    json += i1 + "\"inputPath\":" + sep + quote(result.inputPath) + "," + nl;
+    json += i1 + "\"frameId\":" + sep + quote(result.frameId) + "," + nl;
+    json += i1 + "\"wheelFound\":" + sep + boolToJson(result.wheelFound) + "," + nl;
+    json += i1 + "\"originalCopyPath\":" + sep + quote(result.originalCopyPath) + "," + nl;
+    json += i1 + "\"wheelOverlayPath\":" + sep + quote(result.wheelOverlayPath) + "," + nl;
+    json += i1 + "\"unwrappedBandPath\":" + sep + quote(result.unwrappedBandPath) + "," + nl;
+    json += i1 + "\"notes\":" + nl + notesToJson(result.notes, pretty, level + 1) + "," + nl;
+    json += i1 + "\"stepTimings\":" + nl + stepTimingsToJson(result.stepTimings, pretty, level + 1) + nl;
+    json += i0 + "}";
+    return json;
+}
+
 std::string benchmarkSummaryToJson(const BenchmarkSummary& summary, bool pretty) {
     const std::string i0 = pretty ? indent(0) : "";
     const std::string i1 = pretty ? indent(1) : "";
@@ -182,19 +203,46 @@ std::string benchmarkSummaryToJson(const BenchmarkSummary& summary, bool pretty)
     return json;
 }
 
+void writeWheelGeometryReport(const std::string& path, const std::vector<WheelExtractionResult>& results) {
+    std::ofstream out(path);
+    for (const auto& result : results) {
+        out << "image: " << result.inputPath << "\n";
+        out << "frameId: " << result.frameId << "\n";
+        out << "wheelFound: " << (result.wheelFound ? "true" : "false") << "\n";
+        out << "originalCopy: " << result.originalCopyPath << "\n";
+        out << "wheelOverlay: " << result.wheelOverlayPath << "\n";
+        out << "unwrappedBand: " << result.unwrappedBandPath << "\n";
+        if (!result.notes.empty()) {
+            out << "notes:\n";
+            for (const auto& note : result.notes) {
+                out << "  - " << note << "\n";
+            }
+        }
+        out << "timings:\n";
+        for (const auto& timing : result.stepTimings) {
+            out << "  " << timing.name << ": " << formatDouble(timing.ms) << " ms\n";
+        }
+        out << "\n";
+    }
+}
+
 void printUsage() {
     std::cerr << "Usage:\n"
               << "  tyre_reader_v3 --image <file> --output <folder> [--pretty]\n"
+              << "  tyre_reader_v3 --wheel-image <file> --output <folder> [--pretty]\n"
               << "  tyre_reader_v3 --dir <folder> --output <folder> [--pretty]\n"
-              << "  tyre_reader_v3 --dataset <dataset_root> --output <folder> [--pretty] [--debug-steps]\n";
+              << "  tyre_reader_v3 --dataset <dataset_root> --output <folder> [--pretty] [--debug-steps]\n"
+              << "  tyre_reader_v3 --wheel-debug-dir <folder> --output <folder>\n";
 }
 }  // namespace tyre
 
 int main(int argc, char** argv) {
     try {
         std::string imagePath;
+        std::string wheelImagePath;
         std::string dirPath;
         std::string datasetPath;
+        std::string wheelDebugDirPath;
         std::string outputDir = "output";
         bool pretty = false;
         bool debugSteps = false;
@@ -203,10 +251,14 @@ int main(int argc, char** argv) {
             const std::string arg = argv[i];
             if (arg == "--image" && i + 1 < argc) {
                 imagePath = argv[++i];
+            } else if (arg == "--wheel-image" && i + 1 < argc) {
+                wheelImagePath = argv[++i];
             } else if (arg == "--dir" && i + 1 < argc) {
                 dirPath = argv[++i];
             } else if (arg == "--dataset" && i + 1 < argc) {
                 datasetPath = argv[++i];
+            } else if (arg == "--wheel-debug-dir" && i + 1 < argc) {
+                wheelDebugDirPath = argv[++i];
             } else if (arg == "--output" && i + 1 < argc) {
                 outputDir = argv[++i];
             } else if (arg == "--pretty") {
@@ -219,7 +271,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        const int modeCount = (!imagePath.empty() ? 1 : 0) + (!dirPath.empty() ? 1 : 0) + (!datasetPath.empty() ? 1 : 0);
+        const int modeCount =
+            (!imagePath.empty() ? 1 : 0) + (!wheelImagePath.empty() ? 1 : 0) + (!dirPath.empty() ? 1 : 0) + (!datasetPath.empty() ? 1 : 0) +
+            (!wheelDebugDirPath.empty() ? 1 : 0);
         if (modeCount != 1) {
             tyre::printUsage();
             return 1;
@@ -233,9 +287,27 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (!wheelImagePath.empty()) {
+            tyre::WheelExtractionResult result = analyzer.extractWheelGeometryFile(wheelImagePath, outputDir);
+            result.inputPath = wheelImagePath;
+            std::cout << tyre::wheelExtractionResultToJson(result, pretty) << std::endl;
+            return 0;
+        }
+
         if (!dirPath.empty()) {
             const auto results = analyzer.analyzeDirectory(dirPath, outputDir);
             std::cout << tyre::analysisArrayToJson(results, pretty) << std::endl;
+            return 0;
+        }
+
+        if (!wheelDebugDirPath.empty()) {
+            const auto results = analyzer.extractWheelGeometryDirectory(wheelDebugDirPath, outputDir);
+            const std::string reportPath = (std::filesystem::path(outputDir) / "wheel_geometry_timings.txt").string();
+            tyre::writeWheelGeometryReport(reportPath, results);
+            std::cout << "{"
+                      << "\"processedImages\":" << results.size() << ","
+                      << "\"reportPath\":\"" << tyre::jsonEscape(reportPath) << "\""
+                      << "}" << std::endl;
             return 0;
         }
 

@@ -92,6 +92,17 @@ struct BenchmarkSummary {
     std::string errorsCsvPath;
 };
 
+struct WheelExtractionResult {
+    std::string inputPath;
+    std::string frameId;
+    bool wheelFound = false;
+    std::string originalCopyPath;
+    std::string wheelOverlayPath;
+    std::string unwrappedBandPath;
+    std::vector<std::string> notes;
+    std::vector<NamedTiming> stepTimings;
+};
+
 inline double clamp01(double value) {
     return std::max(0.0, std::min(1.0, value));
 }

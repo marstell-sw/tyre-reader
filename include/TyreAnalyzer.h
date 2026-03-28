@@ -18,6 +18,9 @@ public:
     AnalysisResult analyzeImageFile(const std::string& imagePath, const std::string& outputDir);
     std::vector<AnalysisResult> analyzeDirectory(const std::string& inputDir, const std::string& outputDir);
     AnalysisResult analyzeFrame(const cv::Mat& frame, const std::string& frameId, const std::string& outputDir);
+    WheelExtractionResult extractWheelGeometryFile(const std::string& imagePath, const std::string& outputDir);
+    std::vector<WheelExtractionResult> extractWheelGeometryDirectory(const std::string& inputDir,
+                                                                    const std::string& outputDir);
 
 private:
     struct ParsedSize {
@@ -46,6 +49,12 @@ private:
         ParsedDot dot;
     };
 
+    struct OcrProbe {
+        std::string name;
+        cv::Rect roi;
+        cv::Mat image;
+    };
+
     ImagePreprocessor preprocessor_;
     TesseractOcrEngine ocrEngine_;
     bool saveDebugArtifacts_ = false;
@@ -59,6 +68,14 @@ private:
     static void saveDebugImage(const cv::Mat& image, const std::string& path);
     static void writeDebugReport(const std::string& path, const std::vector<NamedTiming>& timings);
     static std::string sanitizeCsvField(const std::string& value);
+    WheelExtractionResult extractWheelGeometryFrame(const cv::Mat& frame,
+                                                   const std::string& frameId,
+                                                   const std::string& inputPath,
+                                                   const std::string& outputDir) const;
+    std::vector<OcrProbe> buildStripProbes(const cv::Mat& image, const std::string& prefix) const;
+    std::vector<std::pair<std::string, cv::Mat>> buildFastVariants(const cv::Mat& image, bool aggressiveThreshold) const;
+    FieldResult detectTyreSizeField(const cv::Mat& image, const std::string& debugDir, AnalysisResult& result) const;
+    FieldResult detectDotField(const cv::Mat& image, const std::string& debugDir, AnalysisResult& result) const;
 
     ParsedSize parseTyreSize(const std::string& text) const;
     ParsedDot parseDot(const std::string& text) const;

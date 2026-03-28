@@ -81,7 +81,8 @@ bool TesseractOcrEngine::isInitialized() const {
 
 OcrResult TesseractOcrEngine::recognize(const cv::Mat& image,
                                         const std::string& variantName,
-                                        tesseract::PageSegMode pageSegMode) const {
+                                        tesseract::PageSegMode pageSegMode,
+                                        const std::string& whitelist) const {
     OcrResult result;
     result.variantName = variantName;
 
@@ -95,6 +96,7 @@ OcrResult TesseractOcrEngine::recognize(const cv::Mat& image,
     }
 
     api_.SetPageSegMode(pageSegMode);
+    api_.SetVariable("tessedit_char_whitelist", whitelist.c_str());
     api_.SetImage(pix.get());
 
     std::unique_ptr<char[], decltype(&std::free)> text(api_.GetUTF8Text(), &std::free);
@@ -106,11 +108,12 @@ OcrResult TesseractOcrEngine::recognize(const cv::Mat& image,
 
 std::vector<OcrResult> TesseractOcrEngine::recognizeVariants(
     const std::vector<std::pair<std::string, cv::Mat>>& variants,
-    tesseract::PageSegMode pageSegMode) const {
+    tesseract::PageSegMode pageSegMode,
+    const std::string& whitelist) const {
     std::vector<OcrResult> results;
     results.reserve(variants.size());
     for (const auto& variant : variants) {
-        results.push_back(recognize(variant.second, variant.first, pageSegMode));
+        results.push_back(recognize(variant.second, variant.first, pageSegMode, whitelist));
     }
     return results;
 }

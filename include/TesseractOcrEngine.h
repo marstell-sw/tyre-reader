@@ -31,11 +31,13 @@ public:
 
     OcrResult recognize(const cv::Mat& image,
                         const std::string& variantName = "default",
-                        tesseract::PageSegMode pageSegMode = tesseract::PSM_SINGLE_BLOCK) const;
+                        tesseract::PageSegMode pageSegMode = tesseract::PSM_SINGLE_BLOCK,
+                        const std::string& whitelist = "") const;
 
     std::vector<OcrResult> recognizeVariants(
         const std::vector<std::pair<std::string, cv::Mat>>& variants,
-        tesseract::PageSegMode pageSegMode = tesseract::PSM_SINGLE_BLOCK) const;
+        tesseract::PageSegMode pageSegMode = tesseract::PSM_SINGLE_BLOCK,
+        const std::string& whitelist = "") const;
 
 private:
     Settings settings_;

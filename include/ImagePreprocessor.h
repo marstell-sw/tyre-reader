@@ -33,6 +33,8 @@ public:
     struct WheelDebugImages {
         cv::Mat gray;
         cv::Mat blurred;
+        cv::Mat darkMask;
+        cv::Mat contourOverlay;
         cv::Mat circlesOverlay;
         cv::Mat annulusOverlay;
         cv::Mat polarFull;

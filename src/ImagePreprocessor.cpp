@@ -168,51 +168,113 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
         timings->push_back({"wheel_blur_ms", elapsedMs(blurStart, Clock::now())});
     }
 
-    const Clock::time_point houghStart = Clock::now();
-    std::vector<cv::Vec3f> circles;
     const int minDim = std::min(blurred.cols, blurred.rows);
-    cv::HoughCircles(blurred,
-                     circles,
-                     cv::HOUGH_GRADIENT,
-                     1.5,
-                     minDim / 6.0,
-                     100.0,
-                     36.0,
-                     static_cast<int>(minDim * 0.18),
-                     static_cast<int>(minDim * 0.52));
+
+    const Clock::time_point contourMaskStart = Clock::now();
+    cv::Mat darkMask;
+    cv::threshold(blurred, darkMask, 110, 255, cv::THRESH_BINARY_INV);
+    darkMask = morphologyClose(darkMask, std::max(9, blurred.cols / 40), std::max(9, blurred.rows / 40));
+    darkMask = morphologyOpen(darkMask, std::max(5, blurred.cols / 120), std::max(5, blurred.rows / 120));
     if (timings != nullptr) {
-        timings->push_back({"wheel_hough_ms", elapsedMs(houghStart, Clock::now())});
+        timings->push_back({"wheel_mask_ms", elapsedMs(contourMaskStart, Clock::now())});
     }
 
     if (debugImages != nullptr) {
         debugImages->gray = gray;
         debugImages->blurred = blurred;
-    }
-
-    if (circles.empty()) {
-        return geometry;
+        debugImages->darkMask = darkMask;
     }
 
     const cv::Point2f imageCenter(static_cast<float>(blurred.cols) * 0.5F,
                                   static_cast<float>(blurred.rows) * 0.5F);
+
+    const Clock::time_point contourStart = Clock::now();
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(darkMask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (timings != nullptr) {
+        timings->push_back({"wheel_contours_ms", elapsedMs(contourStart, Clock::now())});
+    }
+
     double bestScore = -1.0;
-    cv::Vec3f bestCircle;
-    for (const auto& circle : circles) {
-        const cv::Point2f center(circle[0], circle[1]);
-        const float radius = circle[2];
+    cv::Point2f bestCenter;
+    float bestRadius = 0.0F;
+    cv::Rect bestRect;
+    int bestContourIndex = -1;
+
+    for (std::size_t i = 0; i < contours.size(); ++i) {
+        const double area = cv::contourArea(contours[i]);
+        if (area < minDim * minDim * 0.05) {
+            continue;
+        }
+
+        cv::Point2f center;
+        float radius = 0.0F;
+        cv::minEnclosingCircle(contours[i], center, radius);
+        if (radius < minDim * 0.18F || radius > minDim * 0.60F) {
+            continue;
+        }
+
+        const cv::Rect rect = cv::boundingRect(contours[i]);
+        const double aspect = static_cast<double>(rect.width) / std::max(1, rect.height);
+        if (aspect < 0.7 || aspect > 1.3) {
+            continue;
+        }
+
         const double centerDistance = cv::norm(center - imageCenter) / std::max(1.0, static_cast<double>(minDim));
+        const double fillRatio = area / std::max(1.0, CV_PI * radius * radius);
         const double normalizedRadius = radius / std::max(1.0, static_cast<double>(minDim));
-        const double score = normalizedRadius * 2.0 - centerDistance;
+        const double score = normalizedRadius * 2.2 + fillRatio * 0.9 - centerDistance * 1.1;
         if (score > bestScore) {
             bestScore = score;
-            bestCircle = circle;
+            bestCenter = center;
+            bestRadius = radius;
+            bestRect = rect;
+            bestContourIndex = static_cast<int>(i);
         }
     }
 
+    std::vector<cv::Vec3f> circles;
+    if (bestContourIndex < 0) {
+        const Clock::time_point houghStart = Clock::now();
+        cv::HoughCircles(blurred,
+                         circles,
+                         cv::HOUGH_GRADIENT,
+                         1.5,
+                         minDim / 6.0,
+                         100.0,
+                         36.0,
+                         static_cast<int>(minDim * 0.22),
+                         static_cast<int>(minDim * 0.52));
+        if (timings != nullptr) {
+            timings->push_back({"wheel_hough_ms", elapsedMs(houghStart, Clock::now())});
+        }
+
+        for (const auto& circle : circles) {
+            const cv::Point2f center(circle[0], circle[1]);
+            const float radius = circle[2];
+            const double centerDistance = cv::norm(center - imageCenter) / std::max(1.0, static_cast<double>(minDim));
+            const double normalizedRadius = radius / std::max(1.0, static_cast<double>(minDim));
+            const double score = normalizedRadius * 2.0 - centerDistance;
+            if (score > bestScore) {
+                bestScore = score;
+                bestCenter = center;
+                bestRadius = radius;
+                bestRect = cv::Rect(cvRound(center.x - radius), cvRound(center.y - radius),
+                                    cvRound(radius * 2.0F), cvRound(radius * 2.0F));
+            }
+        }
+    } else if (timings != nullptr) {
+        timings->push_back({"wheel_hough_ms", 0.0});
+    }
+
+    if (bestScore < 0.0 || bestRadius <= 0.0F) {
+        return geometry;
+    }
+
     geometry.found = true;
-    geometry.center = cv::Point2f(bestCircle[0] / static_cast<float>(scale),
-                                  bestCircle[1] / static_cast<float>(scale));
-    geometry.radius = bestCircle[2] / static_cast<float>(scale);
+    geometry.center = cv::Point2f(bestCenter.x / static_cast<float>(scale),
+                                  bestCenter.y / static_cast<float>(scale));
+    geometry.radius = bestRadius / static_cast<float>(scale);
     geometry.innerRadius = geometry.radius * 0.68F;
     geometry.outerRadius = geometry.radius * 0.98F;
     geometry.bounds = cv::Rect(
@@ -222,6 +284,15 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
         std::min(image.rows, static_cast<int>(std::ceil(geometry.outerRadius * 2.0F))));
 
     if (debugImages != nullptr) {
+        cv::Mat contourOverlay;
+        cv::cvtColor(resizedGray, contourOverlay, cv::COLOR_GRAY2BGR);
+        if (bestContourIndex >= 0) {
+            cv::drawContours(contourOverlay, contours, bestContourIndex, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        }
+        cv::rectangle(contourOverlay, bestRect, cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
+        cv::circle(contourOverlay, bestCenter, cvRound(bestRadius), cv::Scalar(0, 255, 0), 3, cv::LINE_AA);
+        debugImages->contourOverlay = contourOverlay;
+
         cv::Mat circlesOverlay;
         cv::cvtColor(resizedGray, circlesOverlay, cv::COLOR_GRAY2BGR);
         for (const auto& circle : circles) {
@@ -233,8 +304,8 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
                        cv::LINE_AA);
         }
         cv::circle(circlesOverlay,
-                   cv::Point(cvRound(bestCircle[0]), cvRound(bestCircle[1])),
-                   cvRound(bestCircle[2]),
+                   bestCenter,
+                   cvRound(bestRadius),
                    cv::Scalar(0, 255, 0),
                    3,
                    cv::LINE_AA);
@@ -258,8 +329,8 @@ cv::Mat ImagePreprocessor::unwrapSidewallBand(const cv::Mat& image,
     }
 
     const Clock::time_point polarStart = Clock::now();
-    const int angleSamples = std::clamp(static_cast<int>(std::round(geometry.outerRadius * 3.2F)), 720, 1800);
-    const int radialSamples = std::clamp(static_cast<int>(std::ceil(geometry.outerRadius)), 64, 220);
+    const int angleSamples = std::max(1440, static_cast<int>(std::round(geometry.outerRadius * 2.0F * static_cast<float>(CV_PI))));
+    const int radialSamples = std::max(128, static_cast<int>(std::ceil(geometry.outerRadius)));
 
     cv::Mat polar;
     cv::warpPolar(image,
@@ -272,19 +343,14 @@ cv::Mat ImagePreprocessor::unwrapSidewallBand(const cv::Mat& image,
         timings->push_back({"wheel_warp_polar_ms", elapsedMs(polarStart, Clock::now())});
     }
 
-    const int innerIndex = std::clamp(static_cast<int>(std::floor(geometry.innerRadius)), 0, std::max(0, polar.cols - 2));
-    const int outerIndex = std::clamp(static_cast<int>(std::ceil(geometry.outerRadius)), innerIndex + 1, polar.cols);
+    const double radialScale = static_cast<double>(radialSamples) / std::max(1.0F, geometry.outerRadius);
+    const int innerIndex =
+        std::clamp(static_cast<int>(std::floor(geometry.innerRadius * radialScale)), 0, std::max(0, polar.cols - 2));
+    const int outerIndex =
+        std::clamp(static_cast<int>(std::ceil(geometry.outerRadius * radialScale)), innerIndex + 1, polar.cols);
     cv::Mat sidewall = polar.colRange(innerIndex, outerIndex).clone();
     cv::transpose(sidewall, sidewall);
     cv::flip(sidewall, sidewall, 0);
-    if (sidewall.rows < 96) {
-        const double scale = 96.0 / std::max(1, sidewall.rows);
-        cv::resize(sidewall, sidewall, cv::Size(), scale, scale, cv::INTER_CUBIC);
-    }
-    if (sidewall.cols > 2200) {
-        const double scale = 2200.0 / static_cast<double>(sidewall.cols);
-        cv::resize(sidewall, sidewall, cv::Size(), scale, scale, cv::INTER_AREA);
-    }
 
     if (debugImages != nullptr) {
         debugImages->polarFull = polar;

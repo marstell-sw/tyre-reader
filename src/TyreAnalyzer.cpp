@@ -77,6 +77,39 @@ std::vector<AnalysisResult> TyreAnalyzer::analyzeDirectory(const std::string& in
     return results;
 }
 
+WheelExtractionResult TyreAnalyzer::extractWheelGeometryFile(const std::string& imagePath, const std::string& outputDir) {
+    const cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
+    WheelExtractionResult result;
+    result.inputPath = imagePath;
+    result.frameId = fs::path(imagePath).stem().string();
+    if (image.empty()) {
+        result.notes.push_back("Unable to read input image.");
+        return result;
+    }
+    return extractWheelGeometryFrame(image, result.frameId, imagePath, outputDir);
+}
+
+std::vector<WheelExtractionResult> TyreAnalyzer::extractWheelGeometryDirectory(const std::string& inputDir,
+                                                                               const std::string& outputDir) {
+    std::vector<WheelExtractionResult> results;
+    std::vector<fs::path> imagePaths;
+    for (const auto& entry : fs::directory_iterator(inputDir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (hasSupportedImageExtension(entry.path().extension().string())) {
+            imagePaths.push_back(entry.path());
+        }
+    }
+
+    std::sort(imagePaths.begin(), imagePaths.end());
+    results.reserve(imagePaths.size());
+    for (const auto& path : imagePaths) {
+        results.push_back(extractWheelGeometryFile(path.string(), outputDir));
+    }
+    return results;
+}
+
 AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
                                           const std::string& frameId,
                                           const std::string& outputDir) {
@@ -121,8 +154,10 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     if (saveDebugArtifacts_) {
         saveDebugImage(wheelDebugImages.gray, (fs::path(debugDir) / "03_wheel_gray.png").string());
         saveDebugImage(wheelDebugImages.blurred, (fs::path(debugDir) / "04_wheel_blurred.png").string());
-        saveDebugImage(wheelDebugImages.circlesOverlay, (fs::path(debugDir) / "05_wheel_circles.png").string());
-        saveDebugImage(wheelDebugImages.annulusOverlay, (fs::path(debugDir) / "06_wheel_annulus.png").string());
+        saveDebugImage(wheelDebugImages.darkMask, (fs::path(debugDir) / "05_wheel_mask.png").string());
+        saveDebugImage(wheelDebugImages.contourOverlay, (fs::path(debugDir) / "06_wheel_contours.png").string());
+        saveDebugImage(wheelDebugImages.circlesOverlay, (fs::path(debugDir) / "07_wheel_circles.png").string());
+        saveDebugImage(wheelDebugImages.annulusOverlay, (fs::path(debugDir) / "08_wheel_annulus.png").string());
     }
     result.timings.preprocessMs = elapsedMs(grayStart, Clock::now());
 
@@ -139,74 +174,40 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
             result.notes.push_back("Wheel detected, but sidewall unwrap failed. Falling back to full image.");
         }
         if (saveDebugArtifacts_) {
-            saveDebugImage(wheelDebugImages.polarFull, (fs::path(debugDir) / "07_polar_full.png").string());
-            saveDebugImage(wheelDebugImages.sidewallBand, (fs::path(debugDir) / "08_sidewall_band.png").string());
+            saveDebugImage(wheelDebugImages.polarFull, (fs::path(debugDir) / "09_polar_full.png").string());
+            saveDebugImage(wheelDebugImages.sidewallBand, (fs::path(debugDir) / "10_sidewall_band.png").string());
         }
     } else {
         result.notes.push_back("Wheel circle not detected. Falling back to full image.");
     }
 
-    const Clock::time_point roiStart = Clock::now();
-    ImagePreprocessor::RoiDebugImages roiDebugImages;
-    std::vector<cv::Rect> overlayBoxes;
-    const std::vector<CandidateRoi> rois =
-        preprocessor_.proposeTextRegions(ocrSource, saveDebugArtifacts_ ? &roiDebugImages : nullptr, &result.stepTimings);
-    result.timings.roiProposalMs = elapsedMs(roiStart, Clock::now());
     if (saveDebugArtifacts_) {
-        saveDebugImage(ocrSource, (fs::path(debugDir) / "09_ocr_source.png").string());
-        saveDebugImage(roiDebugImages.gray, (fs::path(debugDir) / "10_roi_gray.png").string());
-        saveDebugImage(roiDebugImages.clahe, (fs::path(debugDir) / "11_roi_clahe.png").string());
-        saveDebugImage(roiDebugImages.denoised, (fs::path(debugDir) / "12_roi_denoised.png").string());
-        saveDebugImage(roiDebugImages.absGradX, (fs::path(debugDir) / "13_roi_gradx.png").string());
-        saveDebugImage(roiDebugImages.morph, (fs::path(debugDir) / "14_roi_morph.png").string());
-        saveDebugImage(roiDebugImages.threshold, (fs::path(debugDir) / "15_roi_threshold.png").string());
-    }
-    if (rois.empty()) {
-        result.notes.push_back("No ROI candidates found.");
+        saveDebugImage(ocrSource, (fs::path(debugDir) / "11_ocr_source.png").string());
     }
 
-    const Clock::time_point ocrStart = Clock::now();
-    const std::vector<CandidateText> candidateTexts =
-        collectCandidateTexts(ocrSource, rois, debugDir, result, overlayBoxes);
-    result.timings.ocrMs = elapsedMs(ocrStart, Clock::now());
-
-    const Clock::time_point parsingStart = Clock::now();
-    for (const auto& candidate : candidateTexts) {
-        if (candidate.size.found) {
-            const double confidence = computeSizeConfidence(candidate.size, candidate);
-            if (confidence > result.tyreSize.confidence) {
-                result.tyreSize.rawText = candidate.size.raw;
-                result.tyreSize.normalizedText = candidate.size.normalized;
-                result.tyreSize.found = true;
-                result.tyreSize.confidence = confidence;
-                result.tyreSize.uncertainty = 1.0 - confidence;
-                result.tyreSize.roiQuality = candidate.roi.imageQualityScore;
-                result.tyreSize.boundingBox = candidate.roi.box;
-                result.tyreSizeFound = true;
-            }
-        }
-
-        if (candidate.dot.dotFound || candidate.dot.weekYearFound) {
-            const double confidence = computeDotConfidence(candidate.dot, candidate);
-            if (confidence > result.dot.confidence) {
-                result.dot.rawText = candidate.dot.raw;
-                result.dot.normalizedText = candidate.dot.normalized;
-                result.dot.found = candidate.dot.dotFound || candidate.dot.weekYearFound;
-                result.dot.confidence = confidence;
-                result.dot.uncertainty = 1.0 - confidence;
-                result.dot.roiQuality = candidate.roi.imageQualityScore;
-                result.dot.boundingBox = candidate.roi.box;
-
-                result.dotFound = candidate.dot.dotFound || candidate.dot.weekYearFound;
-                result.dotWeekYearFound = candidate.dot.weekYearFound;
-                result.dotFullFound = candidate.dot.fullFound;
-                result.dotWeekYear = candidate.dot.weekYear;
-                result.dotFullRaw = candidate.dot.fullRaw;
-                result.dotFullNormalized = candidate.dot.fullNormalized;
-            }
-        }
+    std::vector<cv::Rect> overlayBoxes;
+    const Clock::time_point sizeStart = Clock::now();
+    result.tyreSize = detectTyreSizeField(ocrSource, debugDir, result);
+    result.timings.roiProposalMs = elapsedMs(sizeStart, Clock::now());
+    if (result.tyreSize.found) {
+        result.tyreSizeFound = true;
+        overlayBoxes.push_back(result.tyreSize.boundingBox);
     }
-    result.timings.parsingMs = elapsedMs(parsingStart, Clock::now());
+
+    const Clock::time_point dotStart = Clock::now();
+    result.dot = detectDotField(ocrSource, debugDir, result);
+    result.timings.ocrMs = elapsedMs(dotStart, Clock::now());
+    if (result.dot.found) {
+        result.dotFound = true;
+        overlayBoxes.push_back(result.dot.boundingBox);
+        const ParsedDot parsedDot = parseDot(result.dot.rawText);
+        result.dotWeekYearFound = parsedDot.weekYearFound;
+        result.dotFullFound = parsedDot.fullFound;
+        result.dotWeekYear = parsedDot.weekYear;
+        result.dotFullRaw = parsedDot.fullRaw;
+        result.dotFullNormalized = parsedDot.fullNormalized;
+    }
+    result.timings.parsingMs = 0.0;
 
     if (!result.tyreSizeFound) {
         result.notes.push_back("Tyre size not found in candidate ROIs.");
@@ -232,18 +233,77 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     result.timings.totalMs = elapsedMs(totalStart, Clock::now());
     appendTiming(result.stepTimings, "total_ms", result.timings.totalMs);
     if (saveDebugArtifacts_) {
-        cv::Mat roiOverlay = frame.clone();
-        if (ocrSource.size() != frame.size() || ocrSource.type() != frame.type()) {
-            roiOverlay = ocrSource.clone();
-        }
-        for (std::size_t index = 0; index < rois.size(); ++index) {
-            cv::rectangle(roiOverlay, rois[index].box, cv::Scalar(255, 200, 0), 2);
-            cv::putText(roiOverlay, std::to_string(index), rois[index].box.tl() + cv::Point(0, -4),
+        cv::Mat roiOverlay = ocrSource.clone();
+        for (std::size_t index = 0; index < overlayBoxes.size(); ++index) {
+            cv::rectangle(roiOverlay, overlayBoxes[index], cv::Scalar(255, 200, 0), 2);
+            cv::putText(roiOverlay, std::to_string(index), overlayBoxes[index].tl() + cv::Point(0, -4),
                         cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
         }
-        saveDebugImage(roiOverlay, (fs::path(debugDir) / "16_roi_overlay.png").string());
+        saveDebugImage(roiOverlay, (fs::path(debugDir) / "20_roi_overlay.png").string());
         writeDebugReport(result.timingReportPath, result.stepTimings);
     }
+    return result;
+}
+
+WheelExtractionResult TyreAnalyzer::extractWheelGeometryFrame(const cv::Mat& frame,
+                                                              const std::string& frameId,
+                                                              const std::string& inputPath,
+                                                              const std::string& outputDir) const {
+    WheelExtractionResult result;
+    result.inputPath = inputPath;
+    result.frameId = frameId;
+    fs::create_directories(outputDir);
+
+    const std::string safeStem = makeSafeStem(frameId.empty() ? "frame" : frameId);
+    result.originalCopyPath = (fs::path(outputDir) / (safeStem + "_01_original.png")).string();
+    result.wheelOverlayPath = (fs::path(outputDir) / (safeStem + "_02_wheel.png")).string();
+    result.unwrappedBandPath = (fs::path(outputDir) / (safeStem + "_03_unwrap.png")).string();
+
+    const Clock::time_point totalStart = Clock::now();
+    const Clock::time_point saveOriginalStart = Clock::now();
+    cv::imwrite(result.originalCopyPath, frame);
+    appendTiming(result.stepTimings, "save_original_ms", elapsedMs(saveOriginalStart, Clock::now()));
+
+    ImagePreprocessor::WheelDebugImages wheelDebugImages;
+    const Clock::time_point wheelStart = Clock::now();
+    const ImagePreprocessor::WheelGeometry wheelGeometry =
+        preprocessor_.detectWheelGeometry(frame, &wheelDebugImages, &result.stepTimings);
+    appendTiming(result.stepTimings, "wheel_total_ms", elapsedMs(wheelStart, Clock::now()));
+    result.wheelFound = wheelGeometry.found;
+
+    const Clock::time_point saveOverlayStart = Clock::now();
+    if (!wheelDebugImages.contourOverlay.empty()) {
+        cv::imwrite(result.wheelOverlayPath, wheelDebugImages.contourOverlay);
+    } else if (!wheelDebugImages.circlesOverlay.empty()) {
+        cv::imwrite(result.wheelOverlayPath, wheelDebugImages.circlesOverlay);
+    } else {
+        cv::imwrite(result.wheelOverlayPath, frame);
+    }
+    appendTiming(result.stepTimings, "save_wheel_overlay_ms", elapsedMs(saveOverlayStart, Clock::now()));
+
+    const Clock::time_point unwrapStart = Clock::now();
+    const cv::Mat unwrapped = preprocessor_.unwrapSidewallBand(frame, wheelGeometry, &wheelDebugImages, &result.stepTimings);
+    appendTiming(result.stepTimings, "unwrap_total_ms", elapsedMs(unwrapStart, Clock::now()));
+
+    const Clock::time_point saveUnwrapStart = Clock::now();
+    if (!unwrapped.empty()) {
+        cv::imwrite(result.unwrappedBandPath, unwrapped);
+    } else {
+        cv::Mat placeholder(160, 640, CV_8UC3, cv::Scalar(20, 20, 20));
+        cv::putText(placeholder, "UNWRAP FAILED", cv::Point(20, 88), cv::FONT_HERSHEY_SIMPLEX, 1.0,
+                    cv::Scalar(220, 220, 220), 2, cv::LINE_AA);
+        cv::imwrite(result.unwrappedBandPath, placeholder);
+    }
+    appendTiming(result.stepTimings, "save_unwrap_ms", elapsedMs(saveUnwrapStart, Clock::now()));
+
+    if (!wheelGeometry.found) {
+        result.notes.push_back("Wheel not found.");
+    }
+    if (wheelGeometry.found && unwrapped.empty()) {
+        result.notes.push_back("Wheel found but unwrap failed.");
+    }
+
+    appendTiming(result.stepTimings, "total_ms", elapsedMs(totalStart, Clock::now()));
     return result;
 }
 
@@ -358,6 +418,221 @@ std::string TyreAnalyzer::sanitizeCsvField(const std::string& value) {
     return out;
 }
 
+std::vector<TyreAnalyzer::OcrProbe> TyreAnalyzer::buildStripProbes(const cv::Mat& image, const std::string& prefix) const {
+    std::vector<OcrProbe> probes;
+    if (image.empty()) {
+        return probes;
+    }
+
+    auto addProbe = [&](const std::string& name, const cv::Rect& roi) {
+        const cv::Rect bounded = roi & cv::Rect(0, 0, image.cols, image.rows);
+        if (bounded.width < 80 || bounded.height < 20) {
+            return;
+        }
+        probes.push_back({name, bounded, image(bounded).clone()});
+    };
+
+    addProbe(prefix + "_full", cv::Rect(0, 0, image.cols, image.rows));
+    addProbe(prefix + "_mid", cv::Rect(0, image.rows / 4, image.cols, image.rows / 2));
+    addProbe(prefix + "_top", cv::Rect(0, 0, image.cols, image.rows / 2));
+    addProbe(prefix + "_bottom", cv::Rect(0, image.rows / 2, image.cols, image.rows / 2));
+    addProbe(prefix + "_center_band", cv::Rect(0, image.rows / 3, image.cols, std::max(24, image.rows / 3)));
+
+    if (prefix == "size") {
+        const int windowWidth = std::max(260, image.cols / 3);
+        const int stride = std::max(180, image.cols / 6);
+        const int bandY = image.rows / 5;
+        const int bandH = std::max(28, (image.rows * 3) / 5);
+        for (int x = 0, index = 0; x < image.cols; x += stride, ++index) {
+            addProbe(prefix + "_win_" + std::to_string(index), cv::Rect(x, bandY, windowWidth, bandH));
+        }
+    }
+
+    if (prefix == "dot") {
+        const int windowWidth = std::max(180, image.cols / 3);
+        const int stride = std::max(120, image.cols / 5);
+        const int bandY = image.rows / 4;
+        const int bandH = std::max(28, image.rows / 2);
+        for (int x = 0, index = 0; x < image.cols; x += stride, ++index) {
+            addProbe(prefix + "_win_" + std::to_string(index), cv::Rect(x, bandY, windowWidth, bandH));
+        }
+    }
+
+    return probes;
+}
+
+std::vector<std::pair<std::string, cv::Mat>> TyreAnalyzer::buildFastVariants(const cv::Mat& image,
+                                                                              bool aggressiveThreshold) const {
+    std::vector<std::pair<std::string, cv::Mat>> variants;
+    if (image.empty()) {
+        return variants;
+    }
+
+    cv::Mat gray = preprocessor_.toGrayscale(image);
+    if (gray.rows < 72) {
+        gray = preprocessor_.resizeUpscale(gray, 2.0);
+    }
+    const cv::Mat clahe = preprocessor_.applyClahe(gray);
+    const cv::Mat adaptive = preprocessor_.adaptiveThresholdImage(clahe);
+    variants.emplace_back("gray", gray);
+    variants.emplace_back("clahe", clahe);
+    variants.emplace_back("adaptive", adaptive);
+    if (aggressiveThreshold) {
+        variants.emplace_back("adaptive_inv", preprocessor_.invertImage(adaptive));
+    }
+    return variants;
+}
+
+FieldResult TyreAnalyzer::detectTyreSizeField(const cv::Mat& image,
+                                              const std::string& debugDir,
+                                              AnalysisResult& result) const {
+    FieldResult best;
+    if (!ocrEngine_.isInitialized() || image.empty()) {
+        return best;
+    }
+
+    const std::string whitelist = "0123456789RZVWHY/ -";
+    const auto probes = buildStripProbes(image, "size");
+    double buildMs = 0.0;
+    double ocrMs = 0.0;
+
+    std::ofstream report;
+    if (saveDebugArtifacts_) {
+        report.open(result.ocrReportPath, std::ios::app);
+        if (report.tellp() == 0) {
+            report << "field,probe,variant,psm,confidence,text,normalized\n";
+        }
+    }
+
+    for (std::size_t probeIndex = 0; probeIndex < probes.size(); ++probeIndex) {
+        if (saveDebugArtifacts_) {
+            saveDebugImage(probes[probeIndex].image,
+                           (fs::path(debugDir) / ("30_size_probe_" + std::to_string(probeIndex) + ".png")).string());
+        }
+
+        const Clock::time_point buildStart = Clock::now();
+        const auto variants = buildFastVariants(probes[probeIndex].image, false);
+        buildMs += elapsedMs(buildStart, Clock::now());
+        if (saveDebugArtifacts_) {
+            for (const auto& variant : variants) {
+                saveDebugImage(variant.second,
+                               (fs::path(debugDir) / ("31_size_" + std::to_string(probeIndex) + "_" + variant.first + ".png")).string());
+            }
+        }
+
+        const Clock::time_point ocrStart = Clock::now();
+        auto lineResults = ocrEngine_.recognizeVariants(variants, tesseract::PSM_SINGLE_LINE, whitelist);
+        auto wordResults = ocrEngine_.recognizeVariants(variants, tesseract::PSM_SINGLE_WORD, whitelist);
+        ocrMs += elapsedMs(ocrStart, Clock::now());
+        lineResults.insert(lineResults.end(), wordResults.begin(), wordResults.end());
+
+        for (const auto& ocr : lineResults) {
+            const ParsedSize parsed = parseTyreSize(ocr.text);
+            if (!parsed.found) {
+                continue;
+            }
+            const double roiQuality = preprocessor_.computeImageQualityScore(preprocessor_.toGrayscale(probes[probeIndex].image));
+            const double confidence = clamp01(0.50 * ocr.averageConfidence + 0.35 * parsed.parseQuality + 0.15 * roiQuality);
+            if (report.is_open()) {
+                report << "size," << sanitizeCsvField(probes[probeIndex].name) << ","
+                       << sanitizeCsvField(ocr.variantName) << ",\"single_line\","
+                       << formatDouble(ocr.averageConfidence) << ","
+                       << sanitizeCsvField(ocr.text) << ","
+                       << sanitizeCsvField(parsed.normalized) << "\n";
+            }
+            if (confidence > best.confidence) {
+                best.rawText = ocr.text;
+                best.normalizedText = parsed.normalized;
+                best.found = true;
+                best.confidence = confidence;
+                best.uncertainty = 1.0 - confidence;
+                best.roiQuality = roiQuality;
+                best.boundingBox = probes[probeIndex].roi;
+            }
+        }
+    }
+
+    appendTiming(result.stepTimings, "size_variants_build_ms", buildMs);
+    appendTiming(result.stepTimings, "size_tesseract_ms", ocrMs);
+    return best;
+}
+
+FieldResult TyreAnalyzer::detectDotField(const cv::Mat& image,
+                                         const std::string& debugDir,
+                                         AnalysisResult& result) const {
+    FieldResult best;
+    if (!ocrEngine_.isInitialized() || image.empty()) {
+        return best;
+    }
+
+    const std::string whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -";
+    const auto probes = buildStripProbes(image, "dot");
+    double buildMs = 0.0;
+    double ocrMs = 0.0;
+
+    std::ofstream report;
+    if (saveDebugArtifacts_) {
+        report.open(result.ocrReportPath, std::ios::app);
+        if (report.tellp() == 0) {
+            report << "field,probe,variant,psm,confidence,text,normalized\n";
+        }
+    }
+
+    for (std::size_t probeIndex = 0; probeIndex < probes.size(); ++probeIndex) {
+        if (saveDebugArtifacts_) {
+            saveDebugImage(probes[probeIndex].image,
+                           (fs::path(debugDir) / ("40_dot_probe_" + std::to_string(probeIndex) + ".png")).string());
+        }
+
+        const Clock::time_point buildStart = Clock::now();
+        const auto variants = buildFastVariants(probes[probeIndex].image, true);
+        buildMs += elapsedMs(buildStart, Clock::now());
+        if (saveDebugArtifacts_) {
+            for (const auto& variant : variants) {
+                saveDebugImage(variant.second,
+                               (fs::path(debugDir) / ("41_dot_" + std::to_string(probeIndex) + "_" + variant.first + ".png")).string());
+            }
+        }
+
+        const Clock::time_point blockStart = Clock::now();
+        auto blockResults = ocrEngine_.recognizeVariants(variants, tesseract::PSM_SINGLE_LINE, whitelist);
+        auto wordResults = ocrEngine_.recognizeVariants(variants, tesseract::PSM_SINGLE_WORD, whitelist);
+        ocrMs += elapsedMs(blockStart, Clock::now());
+        blockResults.insert(blockResults.end(), wordResults.begin(), wordResults.end());
+
+        for (const auto& ocr : blockResults) {
+            const ParsedDot parsed = parseDot(ocr.text);
+            if (!parsed.dotFound && parsed.weekYear.empty()) {
+                continue;
+            }
+            const double roiQuality = preprocessor_.computeImageQualityScore(preprocessor_.toGrayscale(probes[probeIndex].image));
+            const double completeness = parsed.fullFound ? 1.0 : (parsed.weekYearFound ? 0.78 : 0.55);
+            const double confidence = clamp01(0.45 * ocr.averageConfidence + 0.35 * completeness + 0.20 * roiQuality);
+            if (report.is_open()) {
+                report << "dot," << sanitizeCsvField(probes[probeIndex].name) << ","
+                       << sanitizeCsvField(ocr.variantName) << ","
+                       << sanitizeCsvField("mixed") << ","
+                       << formatDouble(ocr.averageConfidence) << ","
+                       << sanitizeCsvField(ocr.text) << ","
+                       << sanitizeCsvField(parsed.normalized.empty() ? parsed.fullNormalized : parsed.normalized) << "\n";
+            }
+            if (confidence > best.confidence) {
+                best.rawText = parsed.raw.empty() ? ocr.text : parsed.raw;
+                best.normalizedText = parsed.normalized.empty() ? parsed.fullNormalized : parsed.normalized;
+                best.found = parsed.dotFound || parsed.weekYearFound;
+                best.confidence = confidence;
+                best.uncertainty = 1.0 - confidence;
+                best.roiQuality = roiQuality;
+                best.boundingBox = probes[probeIndex].roi;
+            }
+        }
+    }
+
+    appendTiming(result.stepTimings, "dot_variants_build_ms", buildMs);
+    appendTiming(result.stepTimings, "dot_tesseract_ms", ocrMs);
+    return best;
+}
+
 TyreAnalyzer::ParsedSize TyreAnalyzer::parseTyreSize(const std::string& text) const {
     ParsedSize result;
     const std::string sanitized = sanitizeForParsing(text);
@@ -390,15 +665,16 @@ TyreAnalyzer::ParsedDot TyreAnalyzer::parseDot(const std::string& text) const {
     const std::string compactOriginal = normalizeDotToken(text);
     const std::string compactDigits = normalizeDotToken(sanitizeForParsing(text));
 
-    const std::regex dotRegex(R"(DOT([A-Z0-9]{6,20}))");
+    const std::regex dotRegex(R"(DOT\s*([A-Z0-9 ]{4,24}))");
     std::smatch dotMatch;
     if (std::regex_search(compactOriginal, dotMatch, dotRegex)) {
+        const std::string dotCompact = normalizeDotToken(dotMatch[1].str());
         result.dotFound = true;
         result.raw = squeezeSpaces(text);
-        result.fullRaw = "DOT" + dotMatch[1].str();
-        result.fullNormalized = result.fullRaw;
+        result.fullRaw = "DOT " + squeezeSpaces(dotMatch[1].str());
+        result.fullNormalized = "DOT" + dotCompact;
         result.normalized = result.fullNormalized;
-        result.fullFound = dotMatch[1].str().size() >= 8;
+        result.fullFound = dotCompact.size() >= 8;
     } else {
         result.raw = squeezeSpaces(text);
     }

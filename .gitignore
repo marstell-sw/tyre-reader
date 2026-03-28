@@ -10,6 +10,12 @@ output/
 analysis_batch/
 analysis_wheel/
 analysis_wheel_one/
+analysis_126/
+prep_output_5mp/
+wheel_batch_output/
+wheel_batch_prep_test/
+.gui_debug_runs/
+.qtcreator/
 *.deb
 tessdata/
 _tmp_tess_pkg/
