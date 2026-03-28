@@ -7,6 +7,7 @@ out-smoke/
 out-smoke-abs/
 out-smoke-db/
 output/
+analysis_batch/
 *.deb
 tessdata/
 _tmp_tess_pkg/

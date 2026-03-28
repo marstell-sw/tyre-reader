@@ -13,7 +13,7 @@ namespace tyre {
 
 class TyreAnalyzer {
 public:
-    TyreAnalyzer();
+    explicit TyreAnalyzer(bool saveDebugArtifacts = false);
 
     AnalysisResult analyzeImageFile(const std::string& imagePath, const std::string& outputDir);
     std::vector<AnalysisResult> analyzeDirectory(const std::string& inputDir, const std::string& outputDir);
@@ -48,12 +48,17 @@ private:
 
     ImagePreprocessor preprocessor_;
     TesseractOcrEngine ocrEngine_;
+    bool saveDebugArtifacts_ = false;
 
     static std::string makeSafeStem(const std::string& value);
     static std::string squeezeSpaces(const std::string& value);
     static std::string sanitizeForParsing(const std::string& value);
     static std::string normalizeDotToken(const std::string& value);
     static bool hasSupportedImageExtension(const std::string& extension);
+    static void appendTiming(std::vector<NamedTiming>& timings, const std::string& name, double ms);
+    static void saveDebugImage(const cv::Mat& image, const std::string& path);
+    static void writeDebugReport(const std::string& path, const std::vector<NamedTiming>& timings);
+    static std::string sanitizeCsvField(const std::string& value);
 
     ParsedSize parseTyreSize(const std::string& text) const;
     ParsedDot parseDot(const std::string& text) const;
@@ -61,6 +66,7 @@ private:
     double computeDotConfidence(const ParsedDot& parsed, const CandidateText& candidate) const;
     std::vector<CandidateText> collectCandidateTexts(const cv::Mat& frame,
                                                      const std::vector<CandidateRoi>& rois,
+                                                     const std::string& debugDir,
                                                      AnalysisResult& result,
                                                      std::vector<cv::Rect>& overlayBoxes) const;
 

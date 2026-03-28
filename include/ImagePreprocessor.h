@@ -12,6 +12,15 @@ namespace tyre {
 
 class ImagePreprocessor {
 public:
+    struct RoiDebugImages {
+        cv::Mat gray;
+        cv::Mat clahe;
+        cv::Mat denoised;
+        cv::Mat absGradX;
+        cv::Mat morph;
+        cv::Mat threshold;
+    };
+
     cv::Mat toGrayscale(const cv::Mat& input) const;
     cv::Mat resizeUpscale(const cv::Mat& input, double scale = 2.0) const;
     cv::Mat applyClahe(const cv::Mat& gray) const;
@@ -26,7 +35,9 @@ public:
     double computeImageQualityScore(const cv::Mat& gray) const;
 
     std::vector<std::pair<std::string, cv::Mat>> buildOcrVariants(const cv::Mat& roi) const;
-    std::vector<CandidateRoi> proposeTextRegions(const cv::Mat& image) const;
+    std::vector<CandidateRoi> proposeTextRegions(const cv::Mat& image,
+                                                 RoiDebugImages* debugImages = nullptr,
+                                                 std::vector<NamedTiming>* timings = nullptr) const;
 
 private:
     static std::vector<cv::Rect> mergeNearbyBoxes(const std::vector<cv::Rect>& boxes,

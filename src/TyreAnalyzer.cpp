@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <regex>
 #include <sstream>
 
@@ -32,15 +33,18 @@ bool isLikelyDotWeekYear(const std::string& weekYear) {
 
 }  // namespace
 
-TyreAnalyzer::TyreAnalyzer()
-    : ocrEngine_(TesseractOcrEngine::Settings{}) {
+TyreAnalyzer::TyreAnalyzer(bool saveDebugArtifacts)
+    : ocrEngine_(TesseractOcrEngine::Settings{}),
+      saveDebugArtifacts_(saveDebugArtifacts) {
 }
 
 AnalysisResult TyreAnalyzer::analyzeImageFile(const std::string& imagePath, const std::string& outputDir) {
     AnalysisResult result;
     result.inputPath = imagePath;
 
+    const Clock::time_point loadStart = Clock::now();
     const cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
+    appendTiming(result.stepTimings, "image_load_ms", elapsedMs(loadStart, Clock::now()));
     if (image.empty()) {
         result.notes.push_back("Unable to read input image.");
         return result;
@@ -83,26 +87,61 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     fs::create_directories(outputDir);
 
     const std::string safeStem = makeSafeStem(frameId.empty() ? "frame" : frameId);
+    const std::string debugDir = (fs::path(outputDir) / safeStem / "debug").string();
     const std::string sizeCropPath = (fs::path(outputDir) / (safeStem + "_size_crop.png")).string();
     const std::string dotCropPath = (fs::path(outputDir) / (safeStem + "_dot_crop.png")).string();
     const std::string overlayPath = (fs::path(outputDir) / (safeStem + "_overlay.png")).string();
+    result.debugDir = debugDir;
+    result.timingReportPath = (fs::path(debugDir) / "timings.csv").string();
+    result.ocrReportPath = (fs::path(debugDir) / "ocr_candidates.csv").string();
+    if (saveDebugArtifacts_) {
+        fs::create_directories(debugDir);
+        saveDebugImage(frame, (fs::path(debugDir) / "00_input.png").string());
+    }
 
-    const Clock::time_point preprocessStart = Clock::now();
+    const Clock::time_point grayStart = Clock::now();
     const cv::Mat gray = preprocessor_.toGrayscale(frame);
+    appendTiming(result.stepTimings, "preprocess_gray_ms", elapsedMs(grayStart, Clock::now()));
+    if (saveDebugArtifacts_) {
+        saveDebugImage(gray, (fs::path(debugDir) / "01_gray.png").string());
+    }
+
+    const Clock::time_point deskewStart = Clock::now();
     const cv::Mat deskewed = preprocessor_.deskewLight(gray);
-    (void)preprocessor_.applyClahe(deskewed);
-    result.timings.preprocessMs = elapsedMs(preprocessStart, Clock::now());
+    appendTiming(result.stepTimings, "preprocess_deskew_ms", elapsedMs(deskewStart, Clock::now()));
+    if (saveDebugArtifacts_) {
+        saveDebugImage(deskewed, (fs::path(debugDir) / "02_deskew.png").string());
+    }
+
+    const Clock::time_point claheStart = Clock::now();
+    const cv::Mat deskewClahe = preprocessor_.applyClahe(deskewed);
+    appendTiming(result.stepTimings, "preprocess_clahe_ms", elapsedMs(claheStart, Clock::now()));
+    if (saveDebugArtifacts_) {
+        saveDebugImage(deskewClahe, (fs::path(debugDir) / "03_deskew_clahe.png").string());
+    }
+    result.timings.preprocessMs = elapsedMs(grayStart, Clock::now());
 
     const Clock::time_point roiStart = Clock::now();
-    const std::vector<CandidateRoi> rois = preprocessor_.proposeTextRegions(frame);
+    ImagePreprocessor::RoiDebugImages roiDebugImages;
     std::vector<cv::Rect> overlayBoxes;
+    const std::vector<CandidateRoi> rois =
+        preprocessor_.proposeTextRegions(frame, saveDebugArtifacts_ ? &roiDebugImages : nullptr, &result.stepTimings);
     result.timings.roiProposalMs = elapsedMs(roiStart, Clock::now());
+    if (saveDebugArtifacts_) {
+        saveDebugImage(roiDebugImages.gray, (fs::path(debugDir) / "10_roi_gray.png").string());
+        saveDebugImage(roiDebugImages.clahe, (fs::path(debugDir) / "11_roi_clahe.png").string());
+        saveDebugImage(roiDebugImages.denoised, (fs::path(debugDir) / "12_roi_denoised.png").string());
+        saveDebugImage(roiDebugImages.absGradX, (fs::path(debugDir) / "13_roi_gradx.png").string());
+        saveDebugImage(roiDebugImages.morph, (fs::path(debugDir) / "14_roi_morph.png").string());
+        saveDebugImage(roiDebugImages.threshold, (fs::path(debugDir) / "15_roi_threshold.png").string());
+    }
     if (rois.empty()) {
         result.notes.push_back("No ROI candidates found.");
     }
 
     const Clock::time_point ocrStart = Clock::now();
-    const std::vector<CandidateText> candidateTexts = collectCandidateTexts(frame, rois, result, overlayBoxes);
+    const std::vector<CandidateText> candidateTexts =
+        collectCandidateTexts(frame, rois, debugDir, result, overlayBoxes);
     result.timings.ocrMs = elapsedMs(ocrStart, Clock::now());
 
     const Clock::time_point parsingStart = Clock::now();
@@ -165,6 +204,17 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     result.timings.overlaySaveMs = elapsedMs(overlayStart, Clock::now());
 
     result.timings.totalMs = elapsedMs(totalStart, Clock::now());
+    appendTiming(result.stepTimings, "total_ms", result.timings.totalMs);
+    if (saveDebugArtifacts_) {
+        cv::Mat roiOverlay = frame.clone();
+        for (std::size_t index = 0; index < rois.size(); ++index) {
+            cv::rectangle(roiOverlay, rois[index].box, cv::Scalar(255, 200, 0), 2);
+            cv::putText(roiOverlay, std::to_string(index), rois[index].box.tl() + cv::Point(0, -4),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
+        }
+        saveDebugImage(roiOverlay, (fs::path(debugDir) / "16_roi_overlay.png").string());
+        writeDebugReport(result.timingReportPath, result.stepTimings);
+    }
     return result;
 }
 
@@ -246,6 +296,37 @@ std::string TyreAnalyzer::normalizeDotToken(const std::string& value) {
 bool TyreAnalyzer::hasSupportedImageExtension(const std::string& extension) {
     const std::string ext = normalizeForComparison(extension);
     return ext == "JPG" || ext == "JPEG" || ext == "PNG" || ext == "BMP" || ext == "TIFF" || ext == "TIF";
+}
+
+void TyreAnalyzer::appendTiming(std::vector<NamedTiming>& timings, const std::string& name, double ms) {
+    timings.push_back({name, ms});
+}
+
+void TyreAnalyzer::saveDebugImage(const cv::Mat& image, const std::string& path) {
+    if (!image.empty()) {
+        cv::imwrite(path, image);
+    }
+}
+
+void TyreAnalyzer::writeDebugReport(const std::string& path, const std::vector<NamedTiming>& timings) {
+    std::ofstream out(path);
+    out << "step,ms\n";
+    for (const auto& timing : timings) {
+        out << sanitizeCsvField(timing.name) << "," << formatDouble(timing.ms) << "\n";
+    }
+}
+
+std::string TyreAnalyzer::sanitizeCsvField(const std::string& value) {
+    std::string out = "\"";
+    for (char c : value) {
+        if (c == '\"') {
+            out += "\"\"";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out += "\"";
+    return out;
 }
 
 TyreAnalyzer::ParsedSize TyreAnalyzer::parseTyreSize(const std::string& text) const {
@@ -340,6 +421,7 @@ double TyreAnalyzer::computeDotConfidence(const ParsedDot& parsed, const Candida
 std::vector<TyreAnalyzer::CandidateText> TyreAnalyzer::collectCandidateTexts(
     const cv::Mat& frame,
     const std::vector<CandidateRoi>& rois,
+    const std::string& debugDir,
     AnalysisResult& result,
     std::vector<cv::Rect>& overlayBoxes) const {
     std::vector<CandidateText> candidates;
@@ -349,7 +431,17 @@ std::vector<TyreAnalyzer::CandidateText> TyreAnalyzer::collectCandidateTexts(
         return candidates;
     }
 
+    std::ofstream ocrReport;
+    if (saveDebugArtifacts_) {
+        fs::create_directories(debugDir);
+        ocrReport.open(result.ocrReportPath);
+        ocrReport << "roi_index,variant,psm,confidence,text,size_found,dot_found,week_year,full_dot\n";
+    }
+
+    double variantsBuildMs = 0.0;
+    double tesseractMs = 0.0;
     for (const auto& roi : rois) {
+        const std::size_t roiIndex = static_cast<std::size_t>(&roi - rois.data());
         const cv::Rect bounded = roi.box & cv::Rect(0, 0, frame.cols, frame.rows);
         if (bounded.empty()) {
             continue;
@@ -365,14 +457,35 @@ std::vector<TyreAnalyzer::CandidateText> TyreAnalyzer::collectCandidateTexts(
 
         overlayBoxes.push_back(bounded);
         const cv::Mat crop = frame(bounded).clone();
+        if (saveDebugArtifacts_) {
+            saveDebugImage(crop, (fs::path(debugDir) / ("20_roi_" + std::to_string(roiIndex) + "_crop.png")).string());
+        }
+        const Clock::time_point variantsStart = Clock::now();
         const auto variants = preprocessor_.buildOcrVariants(crop);
+        variantsBuildMs += elapsedMs(variantsStart, Clock::now());
         if (variants.empty()) {
             continue;
         }
+        if (saveDebugArtifacts_) {
+            for (const auto& variant : variants) {
+                saveDebugImage(variant.second,
+                               (fs::path(debugDir) / ("21_roi_" + std::to_string(roiIndex) + "_" + variant.first + ".png")).string());
+            }
+        }
 
+        const Clock::time_point blockOcrStart = Clock::now();
         std::vector<OcrResult> blockResults = ocrEngine_.recognizeVariants(variants, tesseract::PSM_SINGLE_BLOCK);
+        for (auto& resultItem : blockResults) {
+            resultItem.variantName = "block:" + resultItem.variantName;
+        }
+        tesseractMs += elapsedMs(blockOcrStart, Clock::now());
         if (aspectRatio >= 4.0 && roi.imageQualityScore >= 0.20) {
+            const Clock::time_point lineOcrStart = Clock::now();
             std::vector<OcrResult> lineResults = ocrEngine_.recognizeVariants(variants, tesseract::PSM_SINGLE_LINE);
+            for (auto& resultItem : lineResults) {
+                resultItem.variantName = "line:" + resultItem.variantName;
+            }
+            tesseractMs += elapsedMs(lineOcrStart, Clock::now());
             blockResults.insert(blockResults.end(), lineResults.begin(), lineResults.end());
         }
 
@@ -385,9 +498,24 @@ std::vector<TyreAnalyzer::CandidateText> TyreAnalyzer::collectCandidateTexts(
             candidate.ocr = ocrResult;
             candidate.size = parseTyreSize(ocrResult.text);
             candidate.dot = parseDot(ocrResult.text);
+            if (ocrReport.is_open()) {
+                const bool isLine = ocrResult.variantName.rfind("line:", 0) == 0;
+                ocrReport << roiIndex << ","
+                          << sanitizeCsvField(ocrResult.variantName) << ","
+                          << sanitizeCsvField(isLine ? "single_line" : "single_block") << ","
+                          << formatDouble(ocrResult.averageConfidence) << ","
+                          << sanitizeCsvField(ocrResult.text) << ","
+                          << (candidate.size.found ? "true" : "false") << ","
+                          << (candidate.dot.dotFound ? "true" : "false") << ","
+                          << sanitizeCsvField(candidate.dot.weekYear) << ","
+                          << sanitizeCsvField(candidate.dot.fullNormalized) << "\n";
+            }
             candidates.push_back(std::move(candidate));
         }
     }
+
+    appendTiming(result.stepTimings, "ocr_variants_build_ms", variantsBuildMs);
+    appendTiming(result.stepTimings, "ocr_tesseract_ms", tesseractMs);
 
     if (candidates.empty()) {
         result.notes.push_back("OCR did not produce usable text on any ROI.");

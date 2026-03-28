@@ -23,6 +23,11 @@ struct CandidateRoi {
     double imageQualityScore = 0.0;
 };
 
+struct NamedTiming {
+    std::string name;
+    double ms = 0.0;
+};
+
 struct FieldResult {
     std::string rawText;
     std::string normalizedText;
@@ -61,8 +66,12 @@ struct AnalysisResult {
     std::string dotFullNormalized;
 
     std::string overlayPath;
+    std::string debugDir;
+    std::string timingReportPath;
+    std::string ocrReportPath;
     std::vector<std::string> notes;
     TimingInfo timings;
+    std::vector<NamedTiming> stepTimings;
 };
 
 struct BenchmarkSummary {

@@ -3,9 +3,20 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 namespace tyre {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double elapsedMs(const Clock::time_point& start, const Clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+}  // namespace
 
 cv::Mat ImagePreprocessor::toGrayscale(const cv::Mat& input) const {
     if (input.empty()) {
@@ -151,30 +162,59 @@ std::vector<std::pair<std::string, cv::Mat>> ImagePreprocessor::buildOcrVariants
     return variants;
 }
 
-std::vector<CandidateRoi> ImagePreprocessor::proposeTextRegions(const cv::Mat& image) const {
+std::vector<CandidateRoi> ImagePreprocessor::proposeTextRegions(const cv::Mat& image,
+                                                                RoiDebugImages* debugImages,
+                                                                std::vector<NamedTiming>* timings) const {
     std::vector<CandidateRoi> output;
     if (image.empty()) {
         return output;
     }
 
+    const Clock::time_point grayStart = Clock::now();
     const cv::Mat gray = toGrayscale(image);
-    const cv::Mat clahe = applyClahe(gray);
-    const cv::Mat denoised = bilateralDenoise(clahe);
+    if (timings != nullptr) {
+        timings->push_back({"roi_gray_ms", elapsedMs(grayStart, Clock::now())});
+    }
 
+    const Clock::time_point claheStart = Clock::now();
+    const cv::Mat clahe = applyClahe(gray);
+    if (timings != nullptr) {
+        timings->push_back({"roi_clahe_ms", elapsedMs(claheStart, Clock::now())});
+    }
+
+    const Clock::time_point denoiseStart = Clock::now();
+    const cv::Mat denoised = bilateralDenoise(clahe);
+    if (timings != nullptr) {
+        timings->push_back({"roi_bilateral_ms", elapsedMs(denoiseStart, Clock::now())});
+    }
+
+    const Clock::time_point sobelStart = Clock::now();
     cv::Mat gradX;
     cv::Sobel(denoised, gradX, CV_32F, 1, 0, 3);
     cv::Mat absGradX;
     cv::convertScaleAbs(gradX, absGradX);
+    if (timings != nullptr) {
+        timings->push_back({"roi_sobel_ms", elapsedMs(sobelStart, Clock::now())});
+    }
 
+    const Clock::time_point morphStart = Clock::now();
     cv::Mat morph = morphologyClose(absGradX, std::max(15, image.cols / 25), std::max(3, image.rows / 120));
     cv::Mat thresh;
     cv::threshold(morph, thresh, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
     thresh = morphologyClose(thresh, std::max(17, image.cols / 20), std::max(3, image.rows / 100));
     thresh = morphologyOpen(thresh, 3, 3);
+    if (timings != nullptr) {
+        timings->push_back({"roi_morph_threshold_ms", elapsedMs(morphStart, Clock::now())});
+    }
 
+    const Clock::time_point contourStart = Clock::now();
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(thresh, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (timings != nullptr) {
+        timings->push_back({"roi_contours_ms", elapsedMs(contourStart, Clock::now())});
+    }
 
+    const Clock::time_point filterStart = Clock::now();
     std::vector<cv::Rect> rawBoxes;
     const double imageArea = static_cast<double>(image.cols) * static_cast<double>(image.rows);
     for (const auto& contour : contours) {
@@ -216,6 +256,20 @@ std::vector<CandidateRoi> ImagePreprocessor::proposeTextRegions(const cv::Mat& i
     if (output.size() > 8) {
         output.resize(8);
     }
+
+    if (timings != nullptr) {
+        timings->push_back({"roi_filter_merge_ms", elapsedMs(filterStart, Clock::now())});
+    }
+
+    if (debugImages != nullptr) {
+        debugImages->gray = gray;
+        debugImages->clahe = clahe;
+        debugImages->denoised = denoised;
+        debugImages->absGradX = absGradX;
+        debugImages->morph = morph;
+        debugImages->threshold = thresh;
+    }
+
     return output;
 }
 

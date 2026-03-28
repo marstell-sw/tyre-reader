@@ -62,6 +62,34 @@ std::string timingToJson(const TimingInfo& timings, bool pretty, int level) {
     return json;
 }
 
+std::string stepTimingsToJson(const std::vector<NamedTiming>& timings, bool pretty, int level) {
+    const std::string i0 = pretty ? indent(level) : "";
+    const std::string i1 = pretty ? indent(level + 1) : "";
+    const std::string nl = pretty ? "\n" : "";
+    const std::string sep = pretty ? " " : "";
+
+    std::string json = i0 + "[";
+    if (!timings.empty()) {
+        json += nl;
+    }
+    for (std::size_t i = 0; i < timings.size(); ++i) {
+        json += i1 + "{";
+        if (pretty) {
+            json += "\n" + indent(level + 2) + "\"name\": " + quote(timings[i].name) + ",\n";
+            json += indent(level + 2) + "\"ms\": " + formatDouble(timings[i].ms) + "\n";
+            json += i1 + "}";
+        } else {
+            json += "\"name\":" + sep + quote(timings[i].name) + ",\"ms\":" + sep + formatDouble(timings[i].ms) + "}";
+        }
+        if (i + 1 < timings.size()) {
+            json += ",";
+        }
+        json += nl;
+    }
+    json += i0 + "]";
+    return json;
+}
+
 std::string notesToJson(const std::vector<std::string>& notes, bool pretty, int level) {
     const std::string i0 = pretty ? indent(level) : "";
     const std::string i1 = pretty ? indent(level + 1) : "";
@@ -101,8 +129,12 @@ std::string analysisResultToJson(const AnalysisResult& result, bool pretty, int 
     json += i1 + "\"dotFullRaw\":" + sep + quote(result.dotFullRaw) + "," + nl;
     json += i1 + "\"dotFullNormalized\":" + sep + quote(result.dotFullNormalized) + "," + nl;
     json += i1 + "\"overlayPath\":" + sep + quote(result.overlayPath) + "," + nl;
+    json += i1 + "\"debugDir\":" + sep + quote(result.debugDir) + "," + nl;
+    json += i1 + "\"timingReportPath\":" + sep + quote(result.timingReportPath) + "," + nl;
+    json += i1 + "\"ocrReportPath\":" + sep + quote(result.ocrReportPath) + "," + nl;
     json += i1 + "\"notes\":" + nl + notesToJson(result.notes, pretty, level + 1) + "," + nl;
-    json += i1 + "\"timings\":" + nl + timingToJson(result.timings, pretty, level + 1) + nl;
+    json += i1 + "\"timings\":" + nl + timingToJson(result.timings, pretty, level + 1) + "," + nl;
+    json += i1 + "\"stepTimings\":" + nl + stepTimingsToJson(result.stepTimings, pretty, level + 1) + nl;
     json += i0 + "}";
     return json;
 }
@@ -154,7 +186,7 @@ void printUsage() {
     std::cerr << "Usage:\n"
               << "  tyre_reader_v3 --image <file> --output <folder> [--pretty]\n"
               << "  tyre_reader_v3 --dir <folder> --output <folder> [--pretty]\n"
-              << "  tyre_reader_v3 --dataset <dataset_root> --output <folder> [--pretty]\n";
+              << "  tyre_reader_v3 --dataset <dataset_root> --output <folder> [--pretty] [--debug-steps]\n";
 }
 }  // namespace tyre
 
@@ -165,6 +197,7 @@ int main(int argc, char** argv) {
         std::string datasetPath;
         std::string outputDir = "output";
         bool pretty = false;
+        bool debugSteps = false;
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -178,6 +211,8 @@ int main(int argc, char** argv) {
                 outputDir = argv[++i];
             } else if (arg == "--pretty") {
                 pretty = true;
+            } else if (arg == "--debug-steps") {
+                debugSteps = true;
             } else {
                 tyre::printUsage();
                 return 1;
@@ -190,7 +225,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        tyre::TyreAnalyzer analyzer;
+        tyre::TyreAnalyzer analyzer(debugSteps);
         if (!imagePath.empty()) {
             tyre::AnalysisResult result = analyzer.analyzeImageFile(imagePath, outputDir);
             result.inputPath = imagePath;
