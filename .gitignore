@@ -1,0 +1,12 @@
+.codex/
+db_set/
+build/
+build-*/
+build-wsl24/
+out-smoke/
+out-smoke-abs/
+out-smoke-db/
+output/
+*.deb
+tessdata/
+_tmp_tess_pkg/

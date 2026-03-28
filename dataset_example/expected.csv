@@ -1,0 +1,4 @@
+filename,expected_size,expected_dot4,expected_dot_full,brand,model,difficulty,notes
+image001.png,225/40 R18,3523,DOT1ABC3523,Michelin,Pilot Sport 5,medium,Fianco ben illuminato con DOT quasi completo
+image002.jpg,205/55 R16,1422,DOT7X9M1422,Continental,PremiumContact 6,easy,Testo misura nitido e DOT leggibile
+image003.png,235/45 R17,4821,DOT3KLM4821,Pirelli,Cinturato P7,hard,Rilievo basso e contrasto limitato
