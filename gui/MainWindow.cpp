@@ -1,79 +1,177 @@
 #include "MainWindow.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include <QAction>
 #include <QApplication>
 #include <QDir>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
-#include <QLineEdit>
 #include <QImageReader>
+#include <QKeySequence>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QResizeEvent>
-#include <QScrollArea>
+#include <QScrollBar>
 #include <QSignalBlocker>
-#include <QSlider>
 #include <QStatusBar>
-#include <QStyle>
 #include <QToolBar>
-#include <QToolButton>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 
-ImagePreviewLabel::ImagePreviewLabel(QWidget* parent) : QLabel(parent) {
+ImageViewer::ImageViewer(QWidget* parent) : QScrollArea(parent) {
+    imageLabel_ = new QLabel(this);
+    imageLabel_->setAlignment(Qt::AlignCenter);
+    imageLabel_->setBackgroundRole(QPalette::Base);
+    imageLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+    imageLabel_->installEventFilter(this);
+
+    setWidget(imageLabel_);
+    setWidgetResizable(false);
     setAlignment(Qt::AlignCenter);
+    setBackgroundRole(QPalette::Dark);
+    setFrameShape(QFrame::StyledPanel);
     setMinimumSize(320, 240);
-    setText(QStringLiteral("Seleziona un'immagine dalla galleria."));
-    setStyleSheet(QStringLiteral("QLabel { background: #151515; color: #f3f3f3; border: 1px solid #444; }"));
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+    viewport()->installEventFilter(this);
+    imageLabel_->setText(QStringLiteral("Seleziona un'immagine dalla lista a sinistra."));
 }
 
-void ImagePreviewLabel::setImagePath(const QString& imagePath) {
+void ImageViewer::setImagePath(const QString& imagePath) {
     imagePath_ = imagePath;
     originalPixmap_ = QPixmap(imagePath_);
+    panning_ = false;
+
     if (originalPixmap_.isNull()) {
-        setText(QStringLiteral("Impossibile caricare: %1").arg(imagePath));
+        imageLabel_->setPixmap(QPixmap());
+        imageLabel_->setText(QStringLiteral("Impossibile caricare: %1").arg(imagePath));
+        imageLabel_->adjustSize();
         return;
     }
+
+    imageLabel_->setText(QString());
     refreshPixmap();
 }
 
-void ImagePreviewLabel::setZoomFactor(double zoomFactor) {
-    zoomFactor_ = std::max(0.1, zoomFactor);
-    refreshPixmap();
+void ImageViewer::setZoomFactor(double zoomFactor) {
+    zoomFactor_ = std::clamp(zoomFactor, 0.1, 8.0);
+    if (!fitToWindow_) {
+        refreshPixmap();
+    }
 }
 
-void ImagePreviewLabel::setFitToWindow(bool fitToWindow) {
+void ImageViewer::setFitToWindow(bool fitToWindow) {
     fitToWindow_ = fitToWindow;
     refreshPixmap();
 }
 
-double ImagePreviewLabel::zoomFactor() const {
+double ImageViewer::zoomFactor() const {
     return zoomFactor_;
 }
 
-void ImagePreviewLabel::resizeEvent(QResizeEvent* event) {
-    QLabel::resizeEvent(event);
+bool ImageViewer::fitToWindow() const {
+    return fitToWindow_;
+}
+
+void ImageViewer::zoomIn() {
+    fitToWindow_ = false;
+    setZoomFactor(zoomFactor_ * 1.15);
+}
+
+void ImageViewer::zoomOut() {
+    fitToWindow_ = false;
+    setZoomFactor(zoomFactor_ / 1.15);
+}
+
+void ImageViewer::resetView() {
+    zoomFactor_ = 1.0;
+    fitToWindow_ = true;
     refreshPixmap();
 }
 
-void ImagePreviewLabel::refreshPixmap() {
+bool ImageViewer::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == imageLabel_ || watched == viewport()) {
+        if (event->type() == QEvent::Wheel) {
+            auto* wheelEvent = static_cast<QWheelEvent*>(event);
+            if (wheelEvent->modifiers().testFlag(Qt::ControlModifier)) {
+                if (wheelEvent->angleDelta().y() > 0) {
+                    zoomIn();
+                } else if (wheelEvent->angleDelta().y() < 0) {
+                    zoomOut();
+                }
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseButtonPress) {
+            auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button() == Qt::LeftButton && mouseEvent->modifiers().testFlag(Qt::ControlModifier) && !fitToWindow_) {
+                panning_ = true;
+                lastMousePos_ = mouseEvent->globalPosition().toPoint();
+                viewport()->setCursor(Qt::ClosedHandCursor);
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseMove) {
+            auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (panning_) {
+                const QPoint currentPos = mouseEvent->globalPosition().toPoint();
+                applyPanDelta(currentPos - lastMousePos_);
+                lastMousePos_ = currentPos;
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseButtonRelease) {
+            auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (mouseEvent->button() == Qt::LeftButton && panning_) {
+                panning_ = false;
+                viewport()->unsetCursor();
+                return true;
+            }
+        }
+    }
+
+    return QScrollArea::eventFilter(watched, event);
+}
+
+void ImageViewer::resizeEvent(QResizeEvent* event) {
+    QScrollArea::resizeEvent(event);
+    if (fitToWindow_) {
+        refreshPixmap();
+    }
+}
+
+void ImageViewer::refreshPixmap() {
     if (originalPixmap_.isNull()) {
         return;
     }
+
     if (fitToWindow_) {
-        setPixmap(originalPixmap_.scaled(size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        const QSize targetSize = viewport()->size().boundedTo(originalPixmap_.size());
+        const QPixmap scaled = originalPixmap_.scaled(
+            targetSize.isValid() ? targetSize : viewport()->size(),
+            Qt::KeepAspectRatio,
+            Qt::SmoothTransformation);
+        imageLabel_->setPixmap(scaled);
+        imageLabel_->resize(scaled.size());
+        imageLabel_->adjustSize();
         return;
     }
 
     const QSize scaledSize(
         std::max(1, static_cast<int>(originalPixmap_.width() * zoomFactor_)),
         std::max(1, static_cast<int>(originalPixmap_.height() * zoomFactor_)));
-    const QPixmap scaledPixmap = originalPixmap_.scaled(scaledSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    setPixmap(scaledPixmap);
-    resize(scaledPixmap.size());
+    const QPixmap scaled = originalPixmap_.scaled(scaledSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    imageLabel_->setPixmap(scaled);
+    imageLabel_->resize(scaled.size());
+    imageLabel_->adjustSize();
+}
+
+void ImageViewer::applyPanDelta(const QPoint& delta) {
+    horizontalScrollBar()->setValue(horizontalScrollBar()->value() - delta.x());
+    verticalScrollBar()->setValue(verticalScrollBar()->value() - delta.y());
 }
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
@@ -85,12 +183,22 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
 void MainWindow::buildUi() {
     setWindowTitle(QStringLiteral("Tyre Reader Debug GUI"));
-    resize(1600, 980);
+    resize(1680, 1000);
 
     auto* toolbar = addToolBar(QStringLiteral("Main"));
     toolbar->setMovable(false);
     toolbar->addAction(QStringLiteral("Apri cartella"), this, &MainWindow::openFolder);
     toolbar->addAction(QStringLiteral("Apri file"), this, &MainWindow::openFiles);
+    toolbar->addSeparator();
+    QAction* zoomInAction = toolbar->addAction(QStringLiteral("Zoom +"), this, &MainWindow::zoomIn);
+    zoomInAction->setShortcut(QKeySequence(QStringLiteral("Ctrl++")));
+    addAction(zoomInAction);
+    QAction* zoomOutAction = toolbar->addAction(QStringLiteral("Zoom -"), this, &MainWindow::zoomOut);
+    zoomOutAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+-")));
+    addAction(zoomOutAction);
+    QAction* resetZoomAction = toolbar->addAction(QStringLiteral("Reset vista"), this, &MainWindow::resetZoom);
+    resetZoomAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+0")));
+    addAction(resetZoomAction);
 
     auto* central = new QWidget(this);
     auto* mainLayout = new QVBoxLayout(central);
@@ -126,7 +234,7 @@ void MainWindow::buildUi() {
     zoomSlider_->setRange(10, 400);
     zoomSlider_->setValue(100);
     zoomSlider_->setEnabled(false);
-    zoomSlider_->setToolTip(QStringLiteral("Zoom immagine"));
+    zoomSlider_->setToolTip(QStringLiteral("Zoom [%]"));
     connect(zoomSlider_, &QSlider::valueChanged, this, &MainWindow::zoomSliderChanged);
     controlsLayout->addWidget(zoomSlider_);
 
@@ -139,8 +247,10 @@ void MainWindow::buildUi() {
     galleryList_->setMovement(QListView::Static);
     galleryList_->setIconSize(QSize(128, 96));
     galleryList_->setWrapping(false);
-    galleryList_->setMaximumHeight(140);
+    galleryList_->setMaximumHeight(150);
     galleryList_->setSpacing(8);
+    galleryList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    galleryList_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     connect(galleryList_, &QListWidget::currentItemChanged, this, &MainWindow::gallerySelectionChanged);
     mainLayout->addWidget(galleryList_);
 
@@ -157,12 +267,8 @@ void MainWindow::buildUi() {
     connect(stepList_, &QListWidget::currentItemChanged, this, &MainWindow::stepSelectionChanged);
     imagesLayout->addWidget(stepList_);
 
-    imagePreview_ = new ImagePreviewLabel(this);
-    auto* previewScroll = new QScrollArea(this);
-    previewScroll->setWidgetResizable(true);
-    previewScroll->setBackgroundRole(QPalette::Dark);
-    previewScroll->setWidget(imagePreview_);
-    imagesLayout->addWidget(previewScroll, 1);
+    imageViewer_ = new ImageViewer(this);
+    imagesLayout->addWidget(imageViewer_, 1);
 
     tabWidget->addTab(imagesTab, QStringLiteral("Elaborazioni"));
 
@@ -210,9 +316,9 @@ void MainWindow::openFolder() {
     for (const QByteArray& format : formats) {
         filters << QStringLiteral("*.%1").arg(QString::fromLatin1(format));
     }
-    const QFileInfoList entries = dir.entryInfoList(filters, QDir::Files, QDir::Name | QDir::IgnoreCase);
 
     QStringList files;
+    const QFileInfoList entries = dir.entryInfoList(filters, QDir::Files, QDir::Name | QDir::IgnoreCase);
     for (const QFileInfo& entry : entries) {
         files << entry.absoluteFilePath();
     }
@@ -241,8 +347,8 @@ void MainWindow::setImageList(const QStringList& files) {
     imagePaths_ = files;
     galleryList_->clear();
     stepList_->clear();
-    imagePreview_->setText(QStringLiteral("Seleziona una miniatura in alto."));
-    imagePreview_->setFitToWindow(fitButton_->isChecked());
+    imageViewer_->setImagePath(QString());
+    imageViewer_->resetView();
     logView_->clear();
     resultsTable_->setRowCount(0);
     timingsTable_->setRowCount(0);
@@ -260,6 +366,7 @@ void MainWindow::setImageList(const QStringList& files) {
         currentImageLabel_->setText(QStringLiteral("Nessuna immagine nella selezione."));
     }
     applyGalleryFilter(galleryFilterEdit_->text());
+    syncZoomControlsFromViewer();
 }
 
 void MainWindow::updateGalleryIcons() {
@@ -282,24 +389,15 @@ void MainWindow::gallerySelectionChanged() {
     if (imagePath.isEmpty()) {
         return;
     }
+
     currentImageLabel_->setText(QStringLiteral("Selezionata: %1").arg(imagePath));
     stepList_->clear();
-    imagePreview_->setImagePath(imagePath);
+    imageViewer_->setImagePath(imagePath);
+    imageViewer_->resetView();
     resultsTable_->setRowCount(0);
     timingsTable_->setRowCount(0);
     logView_->setPlainText(QStringLiteral("Immagine selezionata. Premi 'Start elaborazione' per avviare il backend."));
-}
-
-void MainWindow::analyzeCurrentSelection() {
-    const QString imagePath = currentImagePath();
-    if (imagePath.isEmpty()) {
-        return;
-    }
-    if (backend_.isBusy()) {
-        return;
-    }
-    const auto mode = static_cast<BackendClient::RunMode>(modeCombo_->currentData().toInt());
-    backend_.analyzeImage(imagePath, mode);
+    syncZoomControlsFromViewer();
 }
 
 void MainWindow::applyGalleryFilter(const QString& filterText) {
@@ -307,17 +405,29 @@ void MainWindow::applyGalleryFilter(const QString& filterText) {
     int firstVisibleRow = -1;
     for (int row = 0; row < galleryList_->count(); ++row) {
         QListWidgetItem* item = galleryList_->item(row);
-        const bool matches = normalizedFilter.isEmpty() ||
-            item->text().contains(normalizedFilter, Qt::CaseInsensitive);
+        const bool matches = normalizedFilter.isEmpty() || item->text().contains(normalizedFilter, Qt::CaseInsensitive);
         item->setHidden(!matches);
         if (matches && firstVisibleRow < 0) {
             firstVisibleRow = row;
         }
     }
 
-    if (firstVisibleRow >= 0 && (galleryList_->currentItem() == nullptr || galleryList_->currentItem()->isHidden())) {
-        galleryList_->setCurrentRow(firstVisibleRow);
+    if (firstVisibleRow >= 0) {
+        QListWidgetItem* current = galleryList_->currentItem();
+        if (current == nullptr || current->isHidden()) {
+            galleryList_->setCurrentRow(firstVisibleRow);
+        }
     }
+}
+
+void MainWindow::analyzeCurrentSelection() {
+    const QString imagePath = currentImagePath();
+    if (imagePath.isEmpty() || backend_.isBusy()) {
+        return;
+    }
+
+    const auto mode = static_cast<BackendClient::RunMode>(modeCombo_->currentData().toInt());
+    backend_.analyzeImage(imagePath, mode);
 }
 
 void MainWindow::backendStarted(const QString& imagePath) {
@@ -328,8 +438,7 @@ void MainWindow::backendStarted(const QString& imagePath) {
 }
 
 void MainWindow::backendCompleted() {
-    const auto& payload = backend_.lastPayload();
-    updateFromPayload(payload);
+    updateFromPayload(backend_.lastPayload());
     statusLabel_->setText(QStringLiteral("Elaborazione completata."));
     analyzeButton_->setEnabled(true);
     modeCombo_->setEnabled(true);
@@ -337,10 +446,47 @@ void MainWindow::backendCompleted() {
 
 void MainWindow::backendFailed(const QString& errorText) {
     statusLabel_->setText(QStringLiteral("Errore backend."));
-    logView_->setPlainText(errorText);
     analyzeButton_->setEnabled(true);
     modeCombo_->setEnabled(true);
+    logView_->setPlainText(errorText);
     QMessageBox::warning(this, QStringLiteral("Errore backend"), errorText);
+}
+
+void MainWindow::stepSelectionChanged() {
+    if (QListWidgetItem* item = stepList_->currentItem()) {
+        imageViewer_->setImagePath(item->data(Qt::UserRole).toString());
+        syncZoomControlsFromViewer();
+    }
+}
+
+void MainWindow::zoomSliderChanged(int value) {
+    if (fitButton_->isChecked()) {
+        return;
+    }
+    imageViewer_->setZoomFactor(static_cast<double>(value) / 100.0);
+}
+
+void MainWindow::fitToggleChanged(bool checked) {
+    zoomSlider_->setEnabled(!checked);
+    imageViewer_->setFitToWindow(checked);
+    syncZoomControlsFromViewer();
+}
+
+void MainWindow::zoomIn() {
+    fitButton_->setChecked(false);
+    imageViewer_->zoomIn();
+    syncZoomControlsFromViewer();
+}
+
+void MainWindow::zoomOut() {
+    fitButton_->setChecked(false);
+    imageViewer_->zoomOut();
+    syncZoomControlsFromViewer();
+}
+
+void MainWindow::resetZoom() {
+    imageViewer_->resetView();
+    syncZoomControlsFromViewer();
 }
 
 void MainWindow::updateFromPayload(const BackendClient::AnalysisPayload& payload) {
@@ -424,23 +570,10 @@ void MainWindow::updateStepList(const BackendClient::AnalysisPayload& payload) {
     }
 }
 
-void MainWindow::stepSelectionChanged() {
-    if (QListWidgetItem* item = stepList_->currentItem()) {
-        imagePreview_->setImagePath(item->data(Qt::UserRole).toString());
-    }
-}
-
-void MainWindow::zoomSliderChanged(int value) {
-    if (fitButton_->isChecked()) {
-        return;
-    }
-    imagePreview_->setZoomFactor(static_cast<double>(value) / 100.0);
-}
-
-void MainWindow::fitToggleChanged(bool checked) {
-    zoomSlider_->setEnabled(!checked);
-    imagePreview_->setFitToWindow(checked);
-    if (!checked) {
-        imagePreview_->setZoomFactor(static_cast<double>(zoomSlider_->value()) / 100.0);
-    }
+void MainWindow::syncZoomControlsFromViewer() {
+    const QSignalBlocker blockerSlider(zoomSlider_);
+    const QSignalBlocker blockerButton(fitButton_);
+    fitButton_->setChecked(imageViewer_->fitToWindow());
+    zoomSlider_->setEnabled(!imageViewer_->fitToWindow());
+    zoomSlider_->setValue(static_cast<int>(std::round(imageViewer_->zoomFactor() * 100.0)));
 }
