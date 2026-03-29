@@ -12,6 +12,7 @@ analysis_wheel/
 analysis_wheel_one/
 analysis_126/
 prep_output_5mp/
+prep_output_5mp_*/
 wheel_batch_output/
 wheel_batch_prep_test/
 .gui_debug_runs/
@@ -19,3 +20,9 @@ wheel_batch_prep_test/
 *.deb
 tessdata/
 _tmp_tess_pkg/
+ml_artifacts/
+runs/
+__pycache__/
+*.pt
+.venv-yolo/
+out-fast-*/

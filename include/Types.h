@@ -52,12 +52,19 @@ struct TimingInfo {
 struct AnalysisResult {
     std::string inputPath;
     std::string frameId;
+    bool wheelFound = false;
+    double wheelCenterX = 0.0;
+    double wheelCenterY = 0.0;
+    double wheelInnerRadius = 0.0;
+    double wheelOuterRadius = 0.0;
 
     FieldResult tyreSize;
     FieldResult dot;
 
     bool tyreSizeFound = false;
     bool dotFound = false;
+    bool dotKeywordFound = false;
+    bool dotCodeBodyFound = false;
     bool dotWeekYearFound = false;
     bool dotFullFound = false;
 
@@ -96,9 +103,42 @@ struct WheelExtractionResult {
     std::string inputPath;
     std::string frameId;
     bool wheelFound = false;
+    double wheelCenterX = 0.0;
+    double wheelCenterY = 0.0;
+    double wheelInnerRadius = 0.0;
+    double wheelOuterRadius = 0.0;
     std::string originalCopyPath;
     std::string wheelOverlayPath;
     std::string unwrappedBandPath;
+    std::vector<std::string> notes;
+    std::vector<NamedTiming> stepTimings;
+};
+
+struct SectorUnwrapResult {
+    std::string imagePath;
+    std::string branch;
+    double startAngleDeg = 0.0;
+    double endAngleDeg = 0.0;
+    bool wheelFound = false;
+    double wheelCenterX = 0.0;
+    double wheelCenterY = 0.0;
+    double wheelInnerRadius = 0.0;
+    double wheelOuterRadius = 0.0;
+    std::string overlayPath;
+    std::string unwrappedPath;
+    std::vector<std::string> notes;
+    std::vector<NamedTiming> stepTimings;
+};
+
+struct RoiOcrResult {
+    std::string imagePath;
+    std::string branch;
+    cv::Rect roi;
+    std::string rawText;
+    std::string normalizedText;
+    bool found = false;
+    double confidence = 0.0;
+    std::string cropPath;
     std::vector<std::string> notes;
     std::vector<NamedTiming> stepTimings;
 };

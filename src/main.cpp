@@ -3,6 +3,7 @@
 #include "Types.h"
 
 #include <filesystem>
+#include <cstdio>
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
@@ -121,10 +122,17 @@ std::string analysisResultToJson(const AnalysisResult& result, bool pretty, int 
     std::string json = i0 + "{" + nl;
     json += i1 + "\"inputPath\":" + sep + quote(result.inputPath) + "," + nl;
     json += i1 + "\"frameId\":" + sep + quote(result.frameId) + "," + nl;
+    json += i1 + "\"wheelFound\":" + sep + boolToJson(result.wheelFound) + "," + nl;
+    json += i1 + "\"wheelCenterX\":" + sep + formatDouble(result.wheelCenterX) + "," + nl;
+    json += i1 + "\"wheelCenterY\":" + sep + formatDouble(result.wheelCenterY) + "," + nl;
+    json += i1 + "\"wheelInnerRadius\":" + sep + formatDouble(result.wheelInnerRadius) + "," + nl;
+    json += i1 + "\"wheelOuterRadius\":" + sep + formatDouble(result.wheelOuterRadius) + "," + nl;
     json += i1 + "\"tyreSize\":" + nl + fieldResultToJson(result.tyreSize, pretty, level + 1) + "," + nl;
     json += i1 + "\"dot\":" + nl + fieldResultToJson(result.dot, pretty, level + 1) + "," + nl;
     json += i1 + "\"tyreSizeFound\":" + sep + boolToJson(result.tyreSizeFound) + "," + nl;
     json += i1 + "\"dotFound\":" + sep + boolToJson(result.dotFound) + "," + nl;
+    json += i1 + "\"dotKeywordFound\":" + sep + boolToJson(result.dotKeywordFound) + "," + nl;
+    json += i1 + "\"dotCodeBodyFound\":" + sep + boolToJson(result.dotCodeBodyFound) + "," + nl;
     json += i1 + "\"dotWeekYearFound\":" + sep + boolToJson(result.dotWeekYearFound) + "," + nl;
     json += i1 + "\"dotFullFound\":" + sep + boolToJson(result.dotFullFound) + "," + nl;
     json += i1 + "\"dotWeekYear\":" + sep + quote(result.dotWeekYear) + "," + nl;
@@ -168,6 +176,10 @@ std::string wheelExtractionResultToJson(const WheelExtractionResult& result, boo
     json += i1 + "\"inputPath\":" + sep + quote(result.inputPath) + "," + nl;
     json += i1 + "\"frameId\":" + sep + quote(result.frameId) + "," + nl;
     json += i1 + "\"wheelFound\":" + sep + boolToJson(result.wheelFound) + "," + nl;
+    json += i1 + "\"wheelCenterX\":" + sep + formatDouble(result.wheelCenterX) + "," + nl;
+    json += i1 + "\"wheelCenterY\":" + sep + formatDouble(result.wheelCenterY) + "," + nl;
+    json += i1 + "\"wheelInnerRadius\":" + sep + formatDouble(result.wheelInnerRadius) + "," + nl;
+    json += i1 + "\"wheelOuterRadius\":" + sep + formatDouble(result.wheelOuterRadius) + "," + nl;
     json += i1 + "\"originalCopyPath\":" + sep + quote(result.originalCopyPath) + "," + nl;
     json += i1 + "\"wheelOverlayPath\":" + sep + quote(result.wheelOverlayPath) + "," + nl;
     json += i1 + "\"unwrappedBandPath\":" + sep + quote(result.unwrappedBandPath) + "," + nl;
@@ -203,6 +215,52 @@ std::string benchmarkSummaryToJson(const BenchmarkSummary& summary, bool pretty)
     return json;
 }
 
+std::string roiOcrResultToJson(const RoiOcrResult& result, bool pretty, int level = 0) {
+    const std::string i0 = pretty ? indent(level) : "";
+    const std::string i1 = pretty ? indent(level + 1) : "";
+    const std::string nl = pretty ? "\n" : "";
+    const std::string sep = pretty ? " " : "";
+
+    std::string json = i0 + "{" + nl;
+    json += i1 + "\"imagePath\":" + sep + quote(result.imagePath) + "," + nl;
+    json += i1 + "\"branch\":" + sep + quote(result.branch) + "," + nl;
+    json += i1 + "\"roi\":" + sep + quote(std::to_string(result.roi.x) + "," + std::to_string(result.roi.y) + "," +
+                                           std::to_string(result.roi.width) + "," + std::to_string(result.roi.height)) + "," + nl;
+    json += i1 + "\"rawText\":" + sep + quote(result.rawText) + "," + nl;
+    json += i1 + "\"normalizedText\":" + sep + quote(result.normalizedText) + "," + nl;
+    json += i1 + "\"found\":" + sep + boolToJson(result.found) + "," + nl;
+    json += i1 + "\"confidence\":" + sep + formatDouble(result.confidence) + "," + nl;
+    json += i1 + "\"cropPath\":" + sep + quote(result.cropPath) + "," + nl;
+    json += i1 + "\"notes\":" + nl + notesToJson(result.notes, pretty, level + 1) + "," + nl;
+    json += i1 + "\"stepTimings\":" + nl + stepTimingsToJson(result.stepTimings, pretty, level + 1) + nl;
+    json += i0 + "}";
+    return json;
+}
+
+std::string sectorUnwrapResultToJson(const SectorUnwrapResult& result, bool pretty, int level = 0) {
+    const std::string i0 = pretty ? indent(level) : "";
+    const std::string i1 = pretty ? indent(level + 1) : "";
+    const std::string nl = pretty ? "\n" : "";
+    const std::string sep = pretty ? " " : "";
+
+    std::string json = i0 + "{" + nl;
+    json += i1 + "\"imagePath\":" + sep + quote(result.imagePath) + "," + nl;
+    json += i1 + "\"branch\":" + sep + quote(result.branch) + "," + nl;
+    json += i1 + "\"startAngleDeg\":" + sep + formatDouble(result.startAngleDeg) + "," + nl;
+    json += i1 + "\"endAngleDeg\":" + sep + formatDouble(result.endAngleDeg) + "," + nl;
+    json += i1 + "\"wheelFound\":" + sep + boolToJson(result.wheelFound) + "," + nl;
+    json += i1 + "\"wheelCenterX\":" + sep + formatDouble(result.wheelCenterX) + "," + nl;
+    json += i1 + "\"wheelCenterY\":" + sep + formatDouble(result.wheelCenterY) + "," + nl;
+    json += i1 + "\"wheelInnerRadius\":" + sep + formatDouble(result.wheelInnerRadius) + "," + nl;
+    json += i1 + "\"wheelOuterRadius\":" + sep + formatDouble(result.wheelOuterRadius) + "," + nl;
+    json += i1 + "\"overlayPath\":" + sep + quote(result.overlayPath) + "," + nl;
+    json += i1 + "\"unwrappedPath\":" + sep + quote(result.unwrappedPath) + "," + nl;
+    json += i1 + "\"notes\":" + nl + notesToJson(result.notes, pretty, level + 1) + "," + nl;
+    json += i1 + "\"stepTimings\":" + nl + stepTimingsToJson(result.stepTimings, pretty, level + 1) + nl;
+    json += i0 + "}";
+    return json;
+}
+
 void writeWheelGeometryReport(const std::string& path, const std::vector<WheelExtractionResult>& results) {
     std::ofstream out(path);
     for (const auto& result : results) {
@@ -229,6 +287,8 @@ void writeWheelGeometryReport(const std::string& path, const std::vector<WheelEx
 void printUsage() {
     std::cerr << "Usage:\n"
               << "  tyre_reader_v3 --image <file> --output <folder> [--pretty]\n"
+              << "  tyre_reader_v3 --ocr-roi <file> --roi <x,y,w,h> --branch <size|dot> --output <folder> [--pretty]\n"
+              << "  tyre_reader_v3 --unwrap-sector <file> --angles <start,end> --branch <size|dot> --output <folder> [--pretty]\n"
               << "  tyre_reader_v3 --wheel-image <file> --output <folder> [--pretty]\n"
               << "  tyre_reader_v3 --dir <folder> --output <folder> [--pretty]\n"
               << "  tyre_reader_v3 --dataset <dataset_root> --output <folder> [--pretty] [--debug-steps]\n"
@@ -239,6 +299,12 @@ void printUsage() {
 int main(int argc, char** argv) {
     try {
         std::string imagePath;
+        std::string ocrRoiImagePath;
+        std::string unwrapSectorImagePath;
+        std::string ocrRoiBranch = "size";
+        std::string ocrRoiSpec;
+        std::string unwrapAnglesSpec;
+        std::string wheelOverrideSpec;
         std::string wheelImagePath;
         std::string dirPath;
         std::string datasetPath;
@@ -251,6 +317,18 @@ int main(int argc, char** argv) {
             const std::string arg = argv[i];
             if (arg == "--image" && i + 1 < argc) {
                 imagePath = argv[++i];
+            } else if (arg == "--ocr-roi" && i + 1 < argc) {
+                ocrRoiImagePath = argv[++i];
+            } else if (arg == "--unwrap-sector" && i + 1 < argc) {
+                unwrapSectorImagePath = argv[++i];
+            } else if (arg == "--roi" && i + 1 < argc) {
+                ocrRoiSpec = argv[++i];
+            } else if (arg == "--angles" && i + 1 < argc) {
+                unwrapAnglesSpec = argv[++i];
+            } else if (arg == "--wheel-override" && i + 1 < argc) {
+                wheelOverrideSpec = argv[++i];
+            } else if (arg == "--branch" && i + 1 < argc) {
+                ocrRoiBranch = argv[++i];
             } else if (arg == "--wheel-image" && i + 1 < argc) {
                 wheelImagePath = argv[++i];
             } else if (arg == "--dir" && i + 1 < argc) {
@@ -272,7 +350,8 @@ int main(int argc, char** argv) {
         }
 
         const int modeCount =
-            (!imagePath.empty() ? 1 : 0) + (!wheelImagePath.empty() ? 1 : 0) + (!dirPath.empty() ? 1 : 0) + (!datasetPath.empty() ? 1 : 0) +
+            (!imagePath.empty() ? 1 : 0) + (!ocrRoiImagePath.empty() ? 1 : 0) + (!unwrapSectorImagePath.empty() ? 1 : 0) + (!wheelImagePath.empty() ? 1 : 0) +
+            (!dirPath.empty() ? 1 : 0) + (!datasetPath.empty() ? 1 : 0) +
             (!wheelDebugDirPath.empty() ? 1 : 0);
         if (modeCount != 1) {
             tyre::printUsage();
@@ -284,6 +363,51 @@ int main(int argc, char** argv) {
             tyre::AnalysisResult result = analyzer.analyzeImageFile(imagePath, outputDir);
             result.inputPath = imagePath;
             std::cout << tyre::analysisResultToJson(result, pretty) << std::endl;
+            return 0;
+        }
+
+        if (!ocrRoiImagePath.empty()) {
+            int x = 0;
+            int y = 0;
+            int w = 0;
+            int h = 0;
+            if (std::sscanf(ocrRoiSpec.c_str(), "%d,%d,%d,%d", &x, &y, &w, &h) != 4) {
+                tyre::printUsage();
+                return 1;
+            }
+            const tyre::RoiOcrResult result = analyzer.recognizeRoiFile(ocrRoiImagePath, cv::Rect(x, y, w, h), ocrRoiBranch, outputDir);
+            std::cout << tyre::roiOcrResultToJson(result, pretty) << std::endl;
+            return 0;
+        }
+
+        if (!unwrapSectorImagePath.empty()) {
+            double startAngle = 0.0;
+            double endAngle = 0.0;
+            double cx = 0.0;
+            double cy = 0.0;
+            double innerR = 0.0;
+            double outerR = 0.0;
+            const bool useWheelOverride = !wheelOverrideSpec.empty();
+            if (std::sscanf(unwrapAnglesSpec.c_str(), "%lf,%lf", &startAngle, &endAngle) != 2) {
+                tyre::printUsage();
+                return 1;
+            }
+            if (useWheelOverride &&
+                std::sscanf(wheelOverrideSpec.c_str(), "%lf,%lf,%lf,%lf", &cx, &cy, &innerR, &outerR) != 4) {
+                tyre::printUsage();
+                return 1;
+            }
+            const tyre::SectorUnwrapResult result =
+                analyzer.unwrapSectorFile(unwrapSectorImagePath,
+                                          ocrRoiBranch,
+                                          startAngle,
+                                          endAngle,
+                                          useWheelOverride,
+                                          cv::Point2f(static_cast<float>(cx), static_cast<float>(cy)),
+                                          static_cast<float>(innerR),
+                                          static_cast<float>(outerR),
+                                          outputDir);
+            std::cout << tyre::sectorUnwrapResultToJson(result, pretty) << std::endl;
             return 0;
         }
 
