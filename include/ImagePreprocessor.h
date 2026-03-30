@@ -19,6 +19,8 @@ public:
         float innerRadius = 0.0F;
         float outerRadius = 0.0F;
         cv::Rect bounds;
+        cv::RotatedRect innerEllipse;
+        cv::RotatedRect outerEllipse;
     };
 
     struct RoiDebugImages {

@@ -23,6 +23,13 @@ struct CandidateRoi {
     double imageQualityScore = 0.0;
 };
 
+struct YoloDetection {
+    std::string label;
+    double confidence = 0.0;
+    cv::Rect box;
+    bool acceptedForOcr = false;
+};
+
 struct NamedTiming {
     std::string name;
     double ms = 0.0;
@@ -73,12 +80,14 @@ struct AnalysisResult {
     std::string dotFullNormalized;
 
     std::string overlayPath;
+    std::string yoloOverlayPath;
     std::string debugDir;
     std::string timingReportPath;
     std::string ocrReportPath;
     std::vector<std::string> notes;
     TimingInfo timings;
     std::vector<NamedTiming> stepTimings;
+    std::vector<YoloDetection> yoloDetections;
 };
 
 struct BenchmarkSummary {

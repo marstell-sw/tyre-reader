@@ -113,6 +113,48 @@ std::string notesToJson(const std::vector<std::string>& notes, bool pretty, int 
     return json;
 }
 
+std::string yoloDetectionsToJson(const std::vector<YoloDetection>& detections, bool pretty, int level) {
+    const std::string i0 = pretty ? indent(level) : "";
+    const std::string i1 = pretty ? indent(level + 1) : "";
+    const std::string i2 = pretty ? indent(level + 2) : "";
+    const std::string nl = pretty ? "\n" : "";
+    const std::string sep = pretty ? " " : "";
+
+    std::string json = i0 + "[";
+    if (!detections.empty()) {
+        json += nl;
+    }
+    for (std::size_t i = 0; i < detections.size(); ++i) {
+        const auto& detection = detections[i];
+        json += i1 + "{";
+        if (pretty) {
+            json += "\n";
+            json += i2 + "\"label\": " + quote(detection.label) + ",\n";
+            json += i2 + "\"confidence\": " + formatDouble(detection.confidence) + ",\n";
+            json += i2 + "\"acceptedForOcr\": " + boolToJson(detection.acceptedForOcr) + ",\n";
+            json += i2 + "\"boundingBox\": " + quote(std::to_string(detection.box.x) + "," +
+                                                     std::to_string(detection.box.y) + "," +
+                                                     std::to_string(detection.box.width) + "," +
+                                                     std::to_string(detection.box.height)) + "\n";
+            json += i1 + "}";
+        } else {
+            json += "\"label\":" + sep + quote(detection.label) + ","
+                 "\"confidence\":" + sep + formatDouble(detection.confidence) + ","
+                 "\"acceptedForOcr\":" + sep + boolToJson(detection.acceptedForOcr) + ","
+                 "\"boundingBox\":" + sep + quote(std::to_string(detection.box.x) + "," +
+                                                  std::to_string(detection.box.y) + "," +
+                                                  std::to_string(detection.box.width) + "," +
+                                                  std::to_string(detection.box.height)) + "}";
+        }
+        if (i + 1 < detections.size()) {
+            json += ",";
+        }
+        json += nl;
+    }
+    json += i0 + "]";
+    return json;
+}
+
 std::string analysisResultToJson(const AnalysisResult& result, bool pretty, int level = 0) {
     const std::string i0 = pretty ? indent(level) : "";
     const std::string i1 = pretty ? indent(level + 1) : "";
@@ -139,9 +181,11 @@ std::string analysisResultToJson(const AnalysisResult& result, bool pretty, int 
     json += i1 + "\"dotFullRaw\":" + sep + quote(result.dotFullRaw) + "," + nl;
     json += i1 + "\"dotFullNormalized\":" + sep + quote(result.dotFullNormalized) + "," + nl;
     json += i1 + "\"overlayPath\":" + sep + quote(result.overlayPath) + "," + nl;
+    json += i1 + "\"yoloOverlayPath\":" + sep + quote(result.yoloOverlayPath) + "," + nl;
     json += i1 + "\"debugDir\":" + sep + quote(result.debugDir) + "," + nl;
     json += i1 + "\"timingReportPath\":" + sep + quote(result.timingReportPath) + "," + nl;
     json += i1 + "\"ocrReportPath\":" + sep + quote(result.ocrReportPath) + "," + nl;
+    json += i1 + "\"yoloDetections\":" + nl + yoloDetectionsToJson(result.yoloDetections, pretty, level + 1) + "," + nl;
     json += i1 + "\"notes\":" + nl + notesToJson(result.notes, pretty, level + 1) + "," + nl;
     json += i1 + "\"timings\":" + nl + timingToJson(result.timings, pretty, level + 1) + "," + nl;
     json += i1 + "\"stepTimings\":" + nl + stepTimingsToJson(result.stepTimings, pretty, level + 1) + nl;
@@ -287,6 +331,7 @@ void writeWheelGeometryReport(const std::string& path, const std::vector<WheelEx
 void printUsage() {
     std::cerr << "Usage:\n"
               << "  tyre_reader_v3 --image <file> --output <folder> [--pretty]\n"
+              << "  tyre_reader_v3 --image <file> --output <folder> [--skip-ocr] [--pretty]\n"
               << "  tyre_reader_v3 --ocr-roi <file> --roi <x,y,w,h> --branch <size|dot> --output <folder> [--pretty]\n"
               << "  tyre_reader_v3 --unwrap-sector <file> --angles <start,end> --branch <size|dot> --output <folder> [--pretty]\n"
               << "  tyre_reader_v3 --wheel-image <file> --output <folder> [--pretty]\n"
@@ -312,6 +357,7 @@ int main(int argc, char** argv) {
         std::string outputDir = "output";
         bool pretty = false;
         bool debugSteps = false;
+        bool skipOcr = false;
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -343,6 +389,8 @@ int main(int argc, char** argv) {
                 pretty = true;
             } else if (arg == "--debug-steps") {
                 debugSteps = true;
+            } else if (arg == "--skip-ocr") {
+                skipOcr = true;
             } else {
                 tyre::printUsage();
                 return 1;
@@ -358,7 +406,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        tyre::TyreAnalyzer analyzer(debugSteps);
+        tyre::TyreAnalyzer analyzer(debugSteps, skipOcr);
         if (!imagePath.empty()) {
             tyre::AnalysisResult result = analyzer.analyzeImageFile(imagePath, outputDir);
             result.inputPath = imagePath;

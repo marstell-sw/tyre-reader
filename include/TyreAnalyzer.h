@@ -6,6 +6,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,7 +14,8 @@ namespace tyre {
 
 class TyreAnalyzer {
 public:
-    explicit TyreAnalyzer(bool saveDebugArtifacts = false);
+    explicit TyreAnalyzer(bool saveDebugArtifacts = false, bool skipOcr = false);
+    ~TyreAnalyzer();
 
     AnalysisResult analyzeImageFile(const std::string& imagePath, const std::string& outputDir);
     std::vector<AnalysisResult> analyzeDirectory(const std::string& inputDir, const std::string& outputDir);
@@ -36,6 +38,8 @@ public:
                                                                     const std::string& outputDir);
 
 private:
+    struct YoloRuntime;
+
     struct ParsedSize {
         bool found = false;
         std::string raw;
@@ -77,9 +81,28 @@ private:
         double imageQualityScore = 0.0;
     };
 
+    struct YoloPredictionRun {
+        bool ok = false;
+        std::string overlayPath;
+        double elapsedMs = 0.0;
+        std::vector<YoloDetection> detections;
+        std::vector<std::string> notes;
+    };
+
+    struct AnnulusLocalRoi {
+        cv::Mat image;
+        cv::Rect bandRect;
+        double startAngleDeg = 0.0;
+        double endAngleDeg = 0.0;
+        double radiusMin = 0.0;
+        double radiusMax = 0.0;
+    };
+
     ImagePreprocessor preprocessor_;
     TesseractOcrEngine ocrEngine_;
     bool saveDebugArtifacts_ = false;
+    bool skipOcr_ = false;
+    mutable std::unique_ptr<YoloRuntime> yoloRuntime_;
 
     static std::string makeSafeStem(const std::string& value);
     static std::string squeezeSpaces(const std::string& value);
@@ -91,6 +114,23 @@ private:
     static void writeDebugReport(const std::string& path, const std::vector<NamedTiming>& timings);
     static std::string sanitizeCsvField(const std::string& value);
     static cv::Rect clampRect(const cv::Rect& rect, const cv::Size& bounds);
+    static std::pair<double, double> computeAngleRangeDeg(const cv::Rect& rect, const cv::Point2f& center);
+    static double computeAnnulusCompatibility(const cv::Rect& rect, const ImagePreprocessor::WheelGeometry& geometry);
+    static std::pair<double, double> computeRadiusRange(const cv::Rect& rect,
+                                                        const cv::Point2f& center,
+                                                        const ImagePreprocessor::WheelGeometry& geometry,
+                                                        bool preferNarrowBand);
+    static cv::Rect mapPolarWindowToBandRect(const cv::Size& sidewallBandSize,
+                                             const ImagePreprocessor::WheelGeometry& geometry,
+                                             double radiusMin,
+                                             double radiusMax);
+    static AnnulusLocalRoi extractLocalAnnulusRoi(const cv::Mat& sidewallBand,
+                                                  const ImagePreprocessor::WheelGeometry& geometry,
+                                                  const cv::Rect& rect,
+                                                  bool preferNarrowBand);
+    YoloPredictionRun runYoloRoiDetector(const cv::Mat& image,
+                                         const std::string& frameId,
+                                         const std::string& debugDir) const;
     WheelExtractionResult extractWheelGeometryFrame(const cv::Mat& frame,
                                                    const std::string& frameId,
                                                    const std::string& inputPath,

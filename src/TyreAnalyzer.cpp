@@ -4,12 +4,20 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <regex>
 #include <sstream>
+#include <thread>
+
+#ifdef TYRE_READER_WITH_ONNXRUNTIME
+#include <onnxruntime_cxx_api.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -27,6 +35,47 @@ struct TextComponent {
     cv::Rect box;
     double centerY = 0.0;
 };
+
+double intersectionOverUnion(const cv::Rect& a, const cv::Rect& b) {
+    const cv::Rect intersection = a & b;
+    if (intersection.empty()) {
+        return 0.0;
+    }
+    const double intersectionArea = static_cast<double>(intersection.area());
+    const double unionArea = static_cast<double>(a.area() + b.area()) - intersectionArea;
+    return unionArea > 0.0 ? intersectionArea / unionArea : 0.0;
+}
+
+std::vector<int> greedyNms(const std::vector<cv::Rect>& boxes,
+                           const std::vector<float>& scores,
+                           double iouThreshold) {
+    std::vector<int> order(boxes.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+        return scores[static_cast<std::size_t>(lhs)] > scores[static_cast<std::size_t>(rhs)];
+    });
+
+    std::vector<int> kept;
+    std::vector<bool> suppressed(boxes.size(), false);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        const int currentIndex = order[i];
+        if (suppressed[static_cast<std::size_t>(currentIndex)]) {
+            continue;
+        }
+        kept.push_back(currentIndex);
+        for (std::size_t j = i + 1; j < order.size(); ++j) {
+            const int compareIndex = order[j];
+            if (suppressed[static_cast<std::size_t>(compareIndex)]) {
+                continue;
+            }
+            if (intersectionOverUnion(boxes[static_cast<std::size_t>(currentIndex)],
+                                      boxes[static_cast<std::size_t>(compareIndex)]) > iouThreshold) {
+                suppressed[static_cast<std::size_t>(compareIndex)] = true;
+            }
+        }
+    }
+    return kept;
+}
 
 bool isLikelyDotWeekYear(const std::string& weekYear) {
     if (weekYear.size() != 4) {
@@ -67,12 +116,119 @@ cv::Mat cropUnwrappedSector(const cv::Mat& sidewall, double startAngleDeg, doubl
     return extended(cv::Rect(x0, 0, x1 - x0, extended.rows)).clone();
 }
 
+struct LetterboxTransform {
+    cv::Mat image;
+    double scale = 1.0;
+    int padX = 0;
+    int padY = 0;
+};
+
+LetterboxTransform makeLetterboxedImage(const cv::Mat& image, int targetSize) {
+    LetterboxTransform transform;
+    if (image.empty()) {
+        return transform;
+    }
+
+    const double scale = std::min(
+        static_cast<double>(targetSize) / std::max(1, image.cols),
+        static_cast<double>(targetSize) / std::max(1, image.rows));
+    const int resizedWidth = std::max(1, static_cast<int>(std::round(image.cols * scale)));
+    const int resizedHeight = std::max(1, static_cast<int>(std::round(image.rows * scale)));
+
+    cv::Mat resized;
+    cv::resize(image, resized, cv::Size(resizedWidth, resizedHeight), 0.0, 0.0, cv::INTER_LINEAR);
+    cv::Mat canvas(targetSize, targetSize, CV_8UC3, cv::Scalar(114, 114, 114));
+    const int padX = (targetSize - resizedWidth) / 2;
+    const int padY = (targetSize - resizedHeight) / 2;
+    resized.copyTo(canvas(cv::Rect(padX, padY, resizedWidth, resizedHeight)));
+
+    transform.image = canvas;
+    transform.scale = scale;
+    transform.padX = padX;
+    transform.padY = padY;
+    return transform;
+}
+
+cv::Rect mapLetterboxedBoxToOriginal(double cx,
+                                     double cy,
+                                     double width,
+                                     double height,
+                                     const LetterboxTransform& transform,
+                                     const cv::Size& originalSize) {
+    const double x0 = (cx - width * 0.5 - transform.padX) / transform.scale;
+    const double y0 = (cy - height * 0.5 - transform.padY) / transform.scale;
+    const double x1 = (cx + width * 0.5 - transform.padX) / transform.scale;
+    const double y1 = (cy + height * 0.5 - transform.padY) / transform.scale;
+
+    const int ix0 = std::clamp(static_cast<int>(std::round(x0)), 0, std::max(0, originalSize.width - 1));
+    const int iy0 = std::clamp(static_cast<int>(std::round(y0)), 0, std::max(0, originalSize.height - 1));
+    const int ix1 = std::clamp(static_cast<int>(std::round(x1)), ix0 + 1, originalSize.width);
+    const int iy1 = std::clamp(static_cast<int>(std::round(y1)), iy0 + 1, originalSize.height);
+    return cv::Rect(ix0, iy0, ix1 - ix0, iy1 - iy0);
+}
+
 }  // namespace
 
-TyreAnalyzer::TyreAnalyzer(bool saveDebugArtifacts)
+#ifdef TYRE_READER_WITH_ONNXRUNTIME
+struct TyreAnalyzer::YoloRuntime {
+    Ort::Env env;
+    Ort::SessionOptions sessionOptions;
+    std::unique_ptr<Ort::Session> session;
+    std::string modelPath;
+    std::vector<std::string> inputNames;
+    std::vector<std::string> outputNames;
+    std::vector<const char*> inputNamePtrs;
+    std::vector<const char*> outputNamePtrs;
+
+    YoloRuntime()
+        : env(ORT_LOGGING_LEVEL_WARNING, "tyre_reader_yolo") {
+        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        const unsigned int hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+        sessionOptions.SetIntraOpNumThreads(static_cast<int>(std::min(8u, hardwareThreads)));
+        sessionOptions.SetInterOpNumThreads(1);
+    }
+
+    void load(const fs::path& path) {
+        if (session && modelPath == path.string()) {
+            return;
+        }
+
+        session = std::make_unique<Ort::Session>(env, path.string().c_str(), sessionOptions);
+        modelPath = path.string();
+        inputNames.clear();
+        outputNames.clear();
+        inputNamePtrs.clear();
+        outputNamePtrs.clear();
+
+        Ort::AllocatorWithDefaultOptions allocator;
+        const std::size_t inputCount = session->GetInputCount();
+        for (std::size_t i = 0; i < inputCount; ++i) {
+            auto name = session->GetInputNameAllocated(i, allocator);
+            inputNames.emplace_back(name.get());
+        }
+        const std::size_t outputCount = session->GetOutputCount();
+        for (std::size_t i = 0; i < outputCount; ++i) {
+            auto name = session->GetOutputNameAllocated(i, allocator);
+            outputNames.emplace_back(name.get());
+        }
+
+        for (const auto& name : inputNames) {
+            inputNamePtrs.push_back(name.c_str());
+        }
+        for (const auto& name : outputNames) {
+            outputNamePtrs.push_back(name.c_str());
+        }
+    }
+};
+#endif
+
+TyreAnalyzer::TyreAnalyzer(bool saveDebugArtifacts, bool skipOcr)
     : ocrEngine_(TesseractOcrEngine::Settings{}),
-      saveDebugArtifacts_(saveDebugArtifacts) {
+      saveDebugArtifacts_(saveDebugArtifacts),
+      skipOcr_(skipOcr) {
 }
+
+TyreAnalyzer::~TyreAnalyzer() = default;
 
 AnalysisResult TyreAnalyzer::analyzeImageFile(const std::string& imagePath, const std::string& outputDir) {
     AnalysisResult result;
@@ -408,44 +564,186 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     result.timings.preprocessMs = elapsedMs(grayStart, Clock::now());
 
     cv::Mat ocrSource = frame;
+    cv::Mat sidewallBand;
     if (wheelGeometry.found) {
         const Clock::time_point unwrapStart = Clock::now();
-        cv::Mat sidewallBand =
+        sidewallBand =
             preprocessor_.unwrapSidewallBand(frame, wheelGeometry, saveDebugArtifacts_ ? &wheelDebugImages : nullptr, &result.stepTimings);
         appendTiming(result.stepTimings, "wheel_unwrap_total_ms", elapsedMs(unwrapStart, Clock::now()));
         if (!sidewallBand.empty()) {
             ocrSource = sidewallBand;
-            result.notes.push_back("Using unwrapped sidewall band for OCR.");
+            result.notes.push_back("Wheel geometry available for local annulus unwrap.");
         } else {
             result.notes.push_back("Wheel detected, but sidewall unwrap failed. Falling back to full image.");
-        }
-        if (saveDebugArtifacts_) {
-            saveDebugImage(wheelDebugImages.polarFull, (fs::path(debugDir) / "09_polar_full.png").string());
-            saveDebugImage(wheelDebugImages.sidewallBand, (fs::path(debugDir) / "10_sidewall_band.png").string());
         }
     } else {
         result.notes.push_back("Wheel circle not detected. Falling back to full image.");
     }
 
-    if (saveDebugArtifacts_) {
-        saveDebugImage(ocrSource, (fs::path(debugDir) / "11_ocr_source.png").string());
-    }
-
     std::vector<cv::Rect> overlayBoxes;
-    const Clock::time_point sizeStart = Clock::now();
-    result.tyreSize = detectTyreSizeField(ocrSource, debugDir, result);
-    result.timings.roiProposalMs = elapsedMs(sizeStart, Clock::now());
-    if (result.tyreSize.found) {
-        result.tyreSizeFound = true;
-        overlayBoxes.push_back(result.tyreSize.boundingBox);
+    bool sizeFromYolo = false;
+    bool dotFromYolo = false;
+    const Clock::time_point proposalStart = Clock::now();
+    const YoloPredictionRun yoloRun = runYoloRoiDetector(frame, frameId, debugDir);
+    const bool yoloAvailable = yoloRun.ok;
+    appendTiming(result.stepTimings, "yolo_inference_ms", yoloRun.elapsedMs);
+    result.yoloOverlayPath = yoloRun.overlayPath;
+    result.yoloDetections = yoloRun.detections;
+    result.notes.insert(result.notes.end(), yoloRun.notes.begin(), yoloRun.notes.end());
+
+    cv::Rect bestSizeBox;
+    double bestSizeScore = -1.0;
+    cv::Rect bestDotBox;
+    double bestDotScore = -1.0;
+
+    for (auto& detection : result.yoloDetections) {
+        detection.box = clampRect(detection.box, frame.size());
+        if (detection.box.empty()) {
+            continue;
+        }
+        const std::string label = normalizeForComparison(detection.label);
+        double annulusScore = 1.0;
+        if (wheelGeometry.found) {
+            annulusScore = computeAnnulusCompatibility(detection.box, wheelGeometry);
+        }
+        const bool semanticMatch = label == "SIZE" || label == "DOT";
+        detection.acceptedForOcr = semanticMatch && (!wheelGeometry.found || annulusScore >= 0.34);
+        const double combinedScore = detection.confidence * (wheelGeometry.found ? annulusScore : 1.0);
+        if (!detection.acceptedForOcr) {
+            continue;
+        }
+        if (label == "SIZE" && combinedScore > bestSizeScore) {
+            bestSizeScore = combinedScore;
+            bestSizeBox = detection.box;
+        } else if (label == "DOT" && combinedScore > bestDotScore) {
+            bestDotScore = combinedScore;
+            bestDotBox = detection.box;
+        }
     }
+    if (saveDebugArtifacts_) {
+        cv::Mat yoloSelected = frame.clone();
+        for (const auto& detection : result.yoloDetections) {
+            const cv::Scalar color = normalizeForComparison(detection.label) == "SIZE"
+                                         ? (detection.acceptedForOcr ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 120, 0))
+                                         : (normalizeForComparison(detection.label) == "DOT"
+                                                ? (detection.acceptedForOcr ? cv::Scalar(0, 140, 255) : cv::Scalar(0, 70, 140))
+                                                : cv::Scalar(180, 180, 180));
+            const int thickness = detection.acceptedForOcr ? 3 : 1;
+            cv::rectangle(yoloSelected, detection.box, color, thickness, cv::LINE_AA);
+            cv::putText(yoloSelected,
+                        detection.label + " " + formatDouble(detection.confidence, 2),
+                        detection.box.tl() + cv::Point(0, -6),
+                        cv::FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        color,
+                        2,
+                        cv::LINE_AA);
+        }
+        saveDebugImage(yoloSelected, (fs::path(debugDir) / "12_yolo_selected.png").string());
+    }
+    result.timings.roiProposalMs = elapsedMs(proposalStart, Clock::now());
+
+    auto runYoloBranch = [&](const std::string& branch, const cv::Rect& box, FieldResult& field, bool& fieldFound) {
+        if (box.empty()) {
+            return false;
+        }
+
+        std::string sourcePath;
+        cv::Mat sourceImage;
+        if (wheelGeometry.found && !sidewallBand.empty()) {
+            const AnnulusLocalRoi localRoi =
+                extractLocalAnnulusRoi(sidewallBand, wheelGeometry, box, branch == "dot");
+            if (!localRoi.image.empty()) {
+                sourceImage = localRoi.image;
+                sourcePath = (fs::path(debugDir) / ("5" + std::string(branch == "size" ? "0" : "1") + "_yolo_" + branch + "_local.png")).string();
+                saveDebugImage(sourceImage, sourcePath);
+            }
+        }
+        if (sourcePath.empty()) {
+            sourceImage = frame(box).clone();
+            sourcePath = (fs::path(debugDir) / ("5" + std::string(branch == "size" ? "2" : "3") + "_yolo_" + branch + "_crop.png")).string();
+            saveDebugImage(sourceImage, sourcePath);
+        }
+
+        if (sourceImage.empty()) {
+            return false;
+        }
+
+        field.cropPath = sourcePath;
+        field.boundingBox = box;
+        field.roiQuality = wheelGeometry.found ? computeAnnulusCompatibility(box, wheelGeometry) : 1.0;
+        if (skipOcr_) {
+            result.notes.push_back("YOLO ROI prepared for " + branch + " OCR.");
+            return false;
+        }
+
+        const Clock::time_point branchStart = Clock::now();
+        const RoiOcrResult roiOcr = recognizeRoiFile(
+            sourcePath,
+            cv::Rect(0, 0, sourceImage.cols, sourceImage.rows),
+            branch,
+            (fs::path(debugDir) / ("yolo_" + branch + "_ocr")).string());
+        appendTiming(result.stepTimings, "yolo_" + branch + "_total_ms", elapsedMs(branchStart, Clock::now()));
+        for (const auto& timing : roiOcr.stepTimings) {
+            appendTiming(result.stepTimings, "yolo_" + branch + "_" + timing.name, timing.ms);
+        }
+        if (!roiOcr.found) {
+            return false;
+        }
+
+        field.rawText = roiOcr.rawText;
+        field.normalizedText = roiOcr.normalizedText;
+        field.found = roiOcr.found;
+        field.confidence = roiOcr.confidence;
+        field.uncertainty = 1.0 - roiOcr.confidence;
+        fieldFound = true;
+        overlayBoxes.push_back(box);
+        result.notes.push_back("YOLO ROI accepted for " + branch + " OCR.");
+        return true;
+    };
+
+    const Clock::time_point sizeStart = Clock::now();
+    sizeFromYolo = runYoloBranch("size", bestSizeBox, result.tyreSize, result.tyreSizeFound);
+    if (!sizeFromYolo && !yoloAvailable) {
+        result.tyreSize = detectTyreSizeField(ocrSource, debugDir, result);
+        if (result.tyreSize.found) {
+            result.tyreSizeFound = true;
+            overlayBoxes.push_back(result.tyreSize.boundingBox);
+        }
+    }
+    appendTiming(result.stepTimings, "size_branch_total_ms", elapsedMs(sizeStart, Clock::now()));
 
     const Clock::time_point dotStart = Clock::now();
-    result.dot = detectDotField(ocrSource, debugDir, result);
+    dotFromYolo = runYoloBranch("dot", bestDotBox, result.dot, result.dotFound);
+    if (!dotFromYolo && !yoloAvailable) {
+        result.dot = detectDotField(ocrSource, debugDir, result);
+        if (result.dot.found) {
+            result.dotFound = true;
+            overlayBoxes.push_back(result.dot.boundingBox);
+        }
+    }
+    appendTiming(result.stepTimings, "dot_branch_total_ms", elapsedMs(dotStart, Clock::now()));
     result.timings.ocrMs = elapsedMs(dotStart, Clock::now());
+
+    if (skipOcr_) {
+        result.notes.push_back("OCR skipped by request after wheel/YOLO/local-unwarp extraction.");
+        saveCropOrPlaceholder(frame, bestSizeBox, sizeCropPath, "size ROI prepared", !bestSizeBox.empty());
+        saveCropOrPlaceholder(frame, bestDotBox, dotCropPath, "dot ROI prepared", !bestDotBox.empty());
+        saveOverlay(frame, overlayBoxes, bestSizeBox, bestDotBox, overlayPath);
+        result.overlayPath = overlayPath;
+        result.tyreSize.cropPath = result.tyreSize.cropPath.empty() ? sizeCropPath : result.tyreSize.cropPath;
+        result.dot.cropPath = result.dot.cropPath.empty() ? dotCropPath : result.dot.cropPath;
+        result.timings.cropSaveMs = 0.0;
+        result.timings.overlaySaveMs = 0.0;
+        result.timings.totalMs = elapsedMs(totalStart, Clock::now());
+        appendTiming(result.stepTimings, "total_ms", result.timings.totalMs);
+        if (saveDebugArtifacts_) {
+            writeDebugReport(result.timingReportPath, result.stepTimings);
+        }
+        return result;
+    }
+
     if (result.dot.found) {
-        result.dotFound = true;
-        overlayBoxes.push_back(result.dot.boundingBox);
         const ParsedDot parsedDot = parseDot(result.dot.rawText);
         result.dotKeywordFound = parsedDot.dotFound;
         result.dotCodeBodyFound = parsedDot.fullFound || (!parsedDot.fullNormalized.empty() && parsedDot.fullNormalized.size() > 3);
@@ -467,27 +765,45 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     }
 
     const Clock::time_point cropStart = Clock::now();
-    saveCropOrPlaceholder(ocrSource, result.tyreSize.boundingBox, sizeCropPath, "SIZE ROI NOT FOUND", result.tyreSizeFound);
-    saveCropOrPlaceholder(ocrSource, result.dot.boundingBox, dotCropPath, "DOT ROI NOT FOUND", result.dotFound);
+    saveCropOrPlaceholder(sizeFromYolo ? frame : ocrSource,
+                          result.tyreSize.boundingBox,
+                          sizeCropPath,
+                          "SIZE ROI NOT FOUND",
+                          result.tyreSizeFound);
+    saveCropOrPlaceholder(dotFromYolo ? frame : ocrSource,
+                          result.dot.boundingBox,
+                          dotCropPath,
+                          "DOT ROI NOT FOUND",
+                          result.dotFound);
     result.tyreSize.cropPath = sizeCropPath;
     result.dot.cropPath = dotCropPath;
     result.timings.cropSaveMs = elapsedMs(cropStart, Clock::now());
 
     const Clock::time_point overlayStart = Clock::now();
-    saveOverlay(ocrSource, overlayBoxes, result.tyreSize.boundingBox, result.dot.boundingBox, overlayPath);
+    if (sizeFromYolo || dotFromYolo) {
+        saveOverlay(frame,
+                    overlayBoxes,
+                    sizeFromYolo ? result.tyreSize.boundingBox : cv::Rect(),
+                    dotFromYolo ? result.dot.boundingBox : cv::Rect(),
+                    overlayPath);
+    } else {
+        saveOverlay(ocrSource, overlayBoxes, result.tyreSize.boundingBox, result.dot.boundingBox, overlayPath);
+    }
     result.overlayPath = overlayPath;
     result.timings.overlaySaveMs = elapsedMs(overlayStart, Clock::now());
 
     result.timings.totalMs = elapsedMs(totalStart, Clock::now());
     appendTiming(result.stepTimings, "total_ms", result.timings.totalMs);
     if (saveDebugArtifacts_) {
-        cv::Mat roiOverlay = ocrSource.clone();
-        for (std::size_t index = 0; index < overlayBoxes.size(); ++index) {
-            cv::rectangle(roiOverlay, overlayBoxes[index], cv::Scalar(255, 200, 0), 2);
-            cv::putText(roiOverlay, std::to_string(index), overlayBoxes[index].tl() + cv::Point(0, -4),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
+        if (!yoloAvailable) {
+            cv::Mat roiOverlay = ocrSource.clone();
+            for (std::size_t index = 0; index < overlayBoxes.size(); ++index) {
+                cv::rectangle(roiOverlay, overlayBoxes[index], cv::Scalar(255, 200, 0), 2);
+                cv::putText(roiOverlay, std::to_string(index), overlayBoxes[index].tl() + cv::Point(0, -4),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
+            }
+            saveDebugImage(roiOverlay, (fs::path(debugDir) / "20_roi_overlay.png").string());
         }
-        saveDebugImage(roiOverlay, (fs::path(debugDir) / "20_roi_overlay.png").string());
         writeDebugReport(result.timingReportPath, result.stepTimings);
     }
     return result;
@@ -672,6 +988,344 @@ std::string TyreAnalyzer::sanitizeCsvField(const std::string& value) {
 
 cv::Rect TyreAnalyzer::clampRect(const cv::Rect& rect, const cv::Size& bounds) {
     return rect & cv::Rect(0, 0, bounds.width, bounds.height);
+}
+
+std::pair<double, double> TyreAnalyzer::computeAngleRangeDeg(const cv::Rect& rect, const cv::Point2f& center) {
+    std::vector<double> angles;
+    angles.reserve(5);
+    const std::vector<cv::Point2f> points = {
+        cv::Point2f(static_cast<float>(rect.x), static_cast<float>(rect.y)),
+        cv::Point2f(static_cast<float>(rect.x + rect.width), static_cast<float>(rect.y)),
+        cv::Point2f(static_cast<float>(rect.x), static_cast<float>(rect.y + rect.height)),
+        cv::Point2f(static_cast<float>(rect.x + rect.width), static_cast<float>(rect.y + rect.height)),
+        cv::Point2f(static_cast<float>(rect.x + rect.width / 2.0), static_cast<float>(rect.y + rect.height / 2.0))
+    };
+    for (const auto& point : points) {
+        angles.push_back(normalizeAngleDeg(std::atan2(point.y - center.y, point.x - center.x) * 180.0 / CV_PI));
+    }
+    std::sort(angles.begin(), angles.end());
+    double largestGap = -1.0;
+    std::size_t gapIndex = 0;
+    for (std::size_t i = 0; i < angles.size(); ++i) {
+        const double current = angles[i];
+        const double next = (i + 1 < angles.size()) ? angles[i + 1] : (angles.front() + 360.0);
+        const double gap = next - current;
+        if (gap > largestGap) {
+            largestGap = gap;
+            gapIndex = i;
+        }
+    }
+
+    double start = angles[(gapIndex + 1) % angles.size()];
+    double end = angles[gapIndex];
+    if (end <= start) {
+        end += 360.0;
+    }
+    start -= 6.0;
+    end += 6.0;
+    return {normalizeAngleDeg(start), normalizeAngleDeg(end)};
+}
+
+double TyreAnalyzer::computeAnnulusCompatibility(const cv::Rect& rect, const ImagePreprocessor::WheelGeometry& geometry) {
+    if (!geometry.found || geometry.outerRadius <= geometry.innerRadius) {
+        return 1.0;
+    }
+
+    std::vector<double> radii;
+    radii.reserve(5);
+    const std::vector<cv::Point2f> points = {
+        cv::Point2f(static_cast<float>(rect.x), static_cast<float>(rect.y)),
+        cv::Point2f(static_cast<float>(rect.x + rect.width), static_cast<float>(rect.y)),
+        cv::Point2f(static_cast<float>(rect.x), static_cast<float>(rect.y + rect.height)),
+        cv::Point2f(static_cast<float>(rect.x + rect.width), static_cast<float>(rect.y + rect.height)),
+        cv::Point2f(static_cast<float>(rect.x + rect.width / 2.0), static_cast<float>(rect.y + rect.height / 2.0))
+    };
+    for (const auto& point : points) {
+        radii.push_back(cv::norm(point - geometry.center));
+    }
+    const auto [minIt, maxIt] = std::minmax_element(radii.begin(), radii.end());
+    const double boxMin = *minIt;
+    const double boxMax = *maxIt;
+    const double bandMin = geometry.innerRadius * 0.92;
+    const double bandMax = geometry.outerRadius * 1.04;
+    const double overlap = std::max(0.0, std::min(boxMax, bandMax) - std::max(boxMin, bandMin));
+    const double boxSpan = std::max(1.0, boxMax - boxMin);
+    const double overlapScore = clamp01(overlap / boxSpan);
+    const double centerRadius = radii.back();
+    const double normalizedCenter = (centerRadius - geometry.innerRadius) / std::max(1.0f, geometry.outerRadius - geometry.innerRadius);
+    const double centerScore = clamp01(1.0 - std::abs(normalizedCenter - 0.52) / 0.52);
+    return clamp01(0.65 * overlapScore + 0.35 * centerScore);
+}
+
+std::pair<double, double> TyreAnalyzer::computeRadiusRange(const cv::Rect& rect,
+                                                           const cv::Point2f& center,
+                                                           const ImagePreprocessor::WheelGeometry& geometry,
+                                                           bool preferNarrowBand) {
+    std::vector<double> radii;
+    for (int gy = 0; gy <= 4; ++gy) {
+        for (int gx = 0; gx <= 4; ++gx) {
+            const double px = rect.x + rect.width * (static_cast<double>(gx) / 4.0);
+            const double py = rect.y + rect.height * (static_cast<double>(gy) / 4.0);
+            const double radius = cv::norm(cv::Point2f(static_cast<float>(px), static_cast<float>(py)) - center);
+            if (radius >= geometry.innerRadius * 0.90 && radius <= geometry.outerRadius * 1.05) {
+                radii.push_back(radius);
+            }
+        }
+    }
+    if (radii.empty()) {
+        radii.push_back((geometry.innerRadius + geometry.outerRadius) * 0.5);
+    }
+    std::sort(radii.begin(), radii.end());
+    const std::size_t n = radii.size();
+    const double q25 = radii[n / 4];
+    const double median = radii[n / 2];
+    const double q75 = radii[(n * 3) / 4];
+    const double bandWidth = std::max(1.0f, geometry.outerRadius - geometry.innerRadius);
+    const double margin = preferNarrowBand ? bandWidth * 0.05 : bandWidth * 0.08;
+    double radiusMin = std::max(static_cast<double>(geometry.innerRadius), q25 - margin);
+    double radiusMax = std::min(static_cast<double>(geometry.outerRadius), q75 + margin);
+    const double minSpan = preferNarrowBand ? bandWidth * 0.10 : bandWidth * 0.16;
+    if (radiusMax - radiusMin < minSpan) {
+        radiusMin = std::max(static_cast<double>(geometry.innerRadius), median - minSpan * 0.5);
+        radiusMax = std::min(static_cast<double>(geometry.outerRadius), median + minSpan * 0.5);
+    }
+    return {radiusMin, radiusMax};
+}
+
+cv::Rect TyreAnalyzer::mapPolarWindowToBandRect(const cv::Size& sidewallBandSize,
+                                                const ImagePreprocessor::WheelGeometry& geometry,
+                                                double radiusMin,
+                                                double radiusMax) {
+    const double bandWidth = std::max(1.0f, geometry.outerRadius - geometry.innerRadius);
+    const double normMin = clamp01((radiusMin - geometry.innerRadius) / bandWidth);
+    const double normMax = clamp01((radiusMax - geometry.innerRadius) / bandWidth);
+    int rowOuter = static_cast<int>(std::floor((1.0 - normMax) * sidewallBandSize.height));
+    int rowInner = static_cast<int>(std::ceil((1.0 - normMin) * sidewallBandSize.height));
+    rowOuter = std::clamp(rowOuter, 0, std::max(0, sidewallBandSize.height - 1));
+    rowInner = std::clamp(rowInner, rowOuter + 1, sidewallBandSize.height);
+    return cv::Rect(0, rowOuter, sidewallBandSize.width, rowInner - rowOuter);
+}
+
+TyreAnalyzer::AnnulusLocalRoi TyreAnalyzer::extractLocalAnnulusRoi(const cv::Mat& sidewallBand,
+                                                                   const ImagePreprocessor::WheelGeometry& geometry,
+                                                                   const cv::Rect& rect,
+                                                                   bool preferNarrowBand) {
+    AnnulusLocalRoi local;
+    if (sidewallBand.empty() || !geometry.found) {
+        return local;
+    }
+    auto angleRange = computeAngleRangeDeg(rect, geometry.center);
+    auto radiusRange = computeRadiusRange(rect, geometry.center, geometry, preferNarrowBand);
+    cv::Mat sector = cropUnwrappedSector(sidewallBand, angleRange.first, angleRange.second);
+    if (sector.empty()) {
+        return local;
+    }
+    const cv::Rect bandRect = mapPolarWindowToBandRect(sector.size(), geometry, radiusRange.first, radiusRange.second);
+    const cv::Rect bounded = clampRect(bandRect, sector.size());
+    if (bounded.empty()) {
+        return local;
+    }
+    local.image = sector(bounded).clone();
+    local.bandRect = bounded;
+    local.startAngleDeg = angleRange.first;
+    local.endAngleDeg = angleRange.second;
+    local.radiusMin = radiusRange.first;
+    local.radiusMax = radiusRange.second;
+    return local;
+}
+
+TyreAnalyzer::YoloPredictionRun TyreAnalyzer::runYoloRoiDetector(const cv::Mat& image,
+                                                                 const std::string& frameId,
+                                                                 const std::string& debugDir) const {
+    YoloPredictionRun run;
+#ifndef TYRE_READER_WITH_ONNXRUNTIME
+    run.notes.push_back("ONNX Runtime support is not available in this build. Falling back to heuristic ROI proposal.");
+    return run;
+#else
+    const fs::path onnxPath = fs::path("ml_artifacts") / "yolo_runs" / "sidewall_v2_50ep_cpu" / "weights" / "best.onnx";
+    if (!fs::exists(onnxPath)) {
+        run.notes.push_back("YOLO ONNX model not found. Falling back to heuristic ROI proposal.");
+        return run;
+    }
+
+    try {
+        if (!yoloRuntime_) {
+            yoloRuntime_ = std::make_unique<YoloRuntime>();
+        }
+        yoloRuntime_->load(onnxPath);
+    } catch (const std::exception& ex) {
+        run.notes.push_back("Failed to load YOLO ONNX model: " + std::string(ex.what()));
+        return run;
+    }
+
+    const int inputSize = 640;
+    const double confThreshold = 0.20;
+    const double nmsThreshold = 0.45;
+    const std::array<std::string, 4> classNames = {"Brand", "DOT", "Model", "Size"};
+
+    const Clock::time_point inferStart = Clock::now();
+    const LetterboxTransform letterbox = makeLetterboxedImage(image, inputSize);
+    if (letterbox.image.empty()) {
+        run.notes.push_back("Unable to prepare YOLO input image.");
+        return run;
+    }
+
+    cv::Mat rgb;
+    cv::cvtColor(letterbox.image, rgb, cv::COLOR_BGR2RGB);
+    cv::Mat rgbFloat;
+    rgb.convertTo(rgbFloat, CV_32F, 1.0 / 255.0);
+
+    std::vector<cv::Mat> channels;
+    cv::split(rgbFloat, channels);
+    std::vector<float> inputTensor(static_cast<std::size_t>(3 * inputSize * inputSize));
+    const std::size_t planeSize = static_cast<std::size_t>(inputSize * inputSize);
+    for (int channelIndex = 0; channelIndex < 3; ++channelIndex) {
+        std::memcpy(inputTensor.data() + static_cast<std::size_t>(channelIndex) * planeSize,
+                    channels[static_cast<std::size_t>(channelIndex)].ptr<float>(),
+                    planeSize * sizeof(float));
+    }
+
+    const std::array<int64_t, 4> inputShape = {1, 3, inputSize, inputSize};
+    Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value inputValue = Ort::Value::CreateTensor<float>(
+        memoryInfo, inputTensor.data(), inputTensor.size(), inputShape.data(), inputShape.size());
+
+    std::vector<Ort::Value> outputValues;
+    try {
+        outputValues = yoloRuntime_->session->Run(Ort::RunOptions{nullptr},
+                                                  yoloRuntime_->inputNamePtrs.data(),
+                                                  &inputValue,
+                                                  1,
+                                                  yoloRuntime_->outputNamePtrs.data(),
+                                                  yoloRuntime_->outputNamePtrs.size());
+    } catch (const std::exception& ex) {
+        run.notes.push_back("YOLO ONNX inference failed: " + std::string(ex.what()));
+        return run;
+    }
+    run.elapsedMs = elapsedMs(inferStart, Clock::now());
+
+    if (outputValues.empty() || !outputValues.front().IsTensor()) {
+        run.notes.push_back("YOLO ONNX inference returned no tensor outputs.");
+        return run;
+    }
+
+    const Ort::Value& outputValue = outputValues.front();
+    const auto outputShape = outputValue.GetTensorTypeAndShapeInfo().GetShape();
+    if (outputShape.size() != 3 || outputShape[1] < 5 || outputShape[2] <= 0) {
+        run.notes.push_back("Unexpected YOLO ONNX output shape.");
+        return run;
+    }
+
+    const std::size_t channelCount = static_cast<std::size_t>(outputShape[1]);
+    const std::size_t candidateCount = static_cast<std::size_t>(outputShape[2]);
+    const std::size_t classCount = channelCount - 4;
+    const float* predictions = outputValue.GetTensorData<float>();
+
+    std::vector<cv::Rect> boxes;
+    std::vector<float> scores;
+    std::vector<int> classIds;
+    boxes.reserve(candidateCount);
+    scores.reserve(candidateCount);
+    classIds.reserve(candidateCount);
+    for (std::size_t candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
+        const float cx = predictions[candidateIndex];
+        const float cy = predictions[candidateCount + candidateIndex];
+        const float w = predictions[2 * candidateCount + candidateIndex];
+        const float h = predictions[3 * candidateCount + candidateIndex];
+
+        int bestClass = -1;
+        float bestScore = 0.0F;
+        for (std::size_t classIndex = 0; classIndex < classCount; ++classIndex) {
+            const float score = predictions[(4 + classIndex) * candidateCount + candidateIndex];
+            if (score > bestScore) {
+                bestScore = score;
+                bestClass = static_cast<int>(classIndex);
+            }
+        }
+        if (bestClass < 0 || bestScore < confThreshold) {
+            continue;
+        }
+
+        const cv::Rect mapped = mapLetterboxedBoxToOriginal(cx, cy, w, h, letterbox, image.size());
+        if (mapped.width < 12 || mapped.height < 12) {
+            continue;
+        }
+        boxes.push_back(mapped);
+        scores.push_back(bestScore);
+        classIds.push_back(bestClass);
+    }
+
+    std::vector<int> kept;
+    for (int classIndex = 0; classIndex < static_cast<int>(classNames.size()); ++classIndex) {
+        std::vector<cv::Rect> classBoxes;
+        std::vector<float> classScores;
+        std::vector<int> classOriginalIndices;
+        for (std::size_t index = 0; index < boxes.size(); ++index) {
+            if (classIds[index] != classIndex) {
+                continue;
+            }
+            classBoxes.push_back(boxes[index]);
+            classScores.push_back(scores[index]);
+            classOriginalIndices.push_back(static_cast<int>(index));
+        }
+        const std::vector<int> classKept = greedyNms(classBoxes, classScores, nmsThreshold);
+        for (int keptIndex : classKept) {
+            kept.push_back(classOriginalIndices[static_cast<std::size_t>(keptIndex)]);
+        }
+    }
+    std::sort(kept.begin(), kept.end(), [&](int lhs, int rhs) {
+        return scores[static_cast<std::size_t>(lhs)] > scores[static_cast<std::size_t>(rhs)];
+    });
+
+    run.detections.reserve(kept.size());
+    for (int index : kept) {
+        if (classIds[static_cast<std::size_t>(index)] < 0 ||
+            classIds[static_cast<std::size_t>(index)] >= static_cast<int>(classNames.size())) {
+            continue;
+        }
+        YoloDetection detection;
+        detection.label = classNames[static_cast<std::size_t>(classIds[static_cast<std::size_t>(index)])];
+        detection.confidence = scores[static_cast<std::size_t>(index)];
+        detection.box = boxes[static_cast<std::size_t>(index)];
+        run.detections.push_back(std::move(detection));
+    }
+
+    fs::create_directories(debugDir);
+    cv::Mat overlay = image.clone();
+    for (const auto& detection : run.detections) {
+        cv::Scalar color = cv::Scalar(0, 255, 255);
+        const std::string labelUpper = normalizeForComparison(detection.label);
+        if (labelUpper == "SIZE") {
+            color = cv::Scalar(0, 255, 0);
+        } else if (labelUpper == "DOT") {
+            color = cv::Scalar(0, 140, 255);
+        } else if (labelUpper == "BRAND") {
+            color = cv::Scalar(255, 0, 255);
+        } else if (labelUpper == "MODEL") {
+            color = cv::Scalar(255, 255, 0);
+        }
+        cv::rectangle(overlay, detection.box, color, 3, cv::LINE_AA);
+        cv::putText(overlay,
+                    detection.label + " " + formatDouble(detection.confidence, 2),
+                    detection.box.tl() + cv::Point(0, -6),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    color,
+                    2,
+                    cv::LINE_AA);
+    }
+    const std::string safeStem = makeSafeStem(frameId.empty() ? "frame" : frameId);
+    run.overlayPath = (fs::path(debugDir) / ("12_yolo_overlay_" + safeStem + ".png")).string();
+    cv::imwrite(run.overlayPath, overlay);
+
+    run.ok = !run.detections.empty();
+    if (!run.ok) {
+        run.notes.push_back("YOLO detector returned zero detections.");
+    } else {
+        run.notes.push_back("YOLO detector returned " + std::to_string(run.detections.size()) + " candidate ROI(s).");
+    }
+    return run;
+#endif
 }
 
 std::vector<TyreAnalyzer::OcrProbe> TyreAnalyzer::buildStripProbes(const cv::Mat& image, const std::string& prefix) const {

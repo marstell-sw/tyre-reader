@@ -16,6 +16,306 @@ double elapsedMs(const Clock::time_point& start, const Clock::time_point& end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+double sampleCircleStrength(const cv::Mat& edgeMagnitude,
+                            const cv::Point2f& center,
+                            double radius,
+                            int samples,
+                            double startAngleDeg = 0.0,
+                            double endAngleDeg = 360.0) {
+    if (edgeMagnitude.empty() || radius <= 1.0 || samples < 16) {
+        return 0.0;
+    }
+
+    double total = 0.0;
+    int count = 0;
+    const double startRad = startAngleDeg * CV_PI / 180.0;
+    const double endRad = endAngleDeg * CV_PI / 180.0;
+    for (int i = 0; i < samples; ++i) {
+        const double alpha = static_cast<double>(i) / static_cast<double>(samples - 1);
+        const double theta = startRad + (endRad - startRad) * alpha;
+        const int x = cvRound(center.x + radius * std::cos(theta));
+        const int y = cvRound(center.y + radius * std::sin(theta));
+        if (x < 1 || y < 1 || x >= edgeMagnitude.cols - 1 || y >= edgeMagnitude.rows - 1) {
+            continue;
+        }
+        total += static_cast<double>(edgeMagnitude.at<std::uint8_t>(y, x));
+        ++count;
+    }
+
+    if (count == 0) {
+        return 0.0;
+    }
+    return total / static_cast<double>(count);
+}
+
+float refineOuterRadiusFromEdges(const cv::Mat& blurred,
+                                 const cv::Point2f& center,
+                                 float innerHoleRadius,
+                                 int minDim) {
+    if (blurred.empty() || innerHoleRadius <= 0.0F) {
+        return 0.0F;
+    }
+
+    cv::Mat gradX;
+    cv::Mat gradY;
+    cv::Sobel(blurred, gradX, CV_32F, 1, 0, 3);
+    cv::Sobel(blurred, gradY, CV_32F, 0, 1, 3);
+    cv::Mat magnitude;
+    cv::magnitude(gradX, gradY, magnitude);
+    cv::Mat edgeMagnitude;
+    cv::convertScaleAbs(magnitude, edgeMagnitude);
+    cv::GaussianBlur(edgeMagnitude, edgeMagnitude, cv::Size(5, 5), 0.0);
+
+    const double minRadius = std::max(innerHoleRadius * 1.18F, static_cast<float>(minDim) * 0.28F);
+    const double maxRadius = std::min(innerHoleRadius * 1.75F, static_cast<float>(minDim) * 0.56F);
+    if (maxRadius <= minRadius + 4.0) {
+        return innerHoleRadius / 0.72F;
+    }
+
+    double bestScore = -1.0;
+    float bestRadius = innerHoleRadius / 0.72F;
+    const int samples = 720;
+    for (double radius = minRadius; radius <= maxRadius; radius += 2.0) {
+        const double edgeScore = sampleCircleStrength(edgeMagnitude, center, radius, samples, 200.0, 340.0);
+        const double normalizedRadius = radius / std::max(1, minDim);
+        const double score = edgeScore + normalizedRadius * 8.0;
+        if (score > bestScore) {
+            bestScore = score;
+            bestRadius = static_cast<float>(radius);
+        }
+    }
+
+    return bestRadius;
+}
+
+cv::RotatedRect ellipseFromCircle(const cv::Point2f& center, float radius) {
+    return cv::RotatedRect(center, cv::Size2f(radius * 2.0F, radius * 2.0F), 0.0F);
+}
+
+cv::RotatedRect fitBestOuterEllipse(const std::vector<std::vector<cv::Point>>& contours,
+                                    const cv::Point2f& center,
+                                    float targetRadius,
+                                    float holeRadius,
+                                    int minDim) {
+    double bestScore = -1.0;
+    cv::RotatedRect bestEllipse = ellipseFromCircle(center, targetRadius);
+
+    for (const auto& contour : contours) {
+        if (contour.size() < 5) {
+            continue;
+        }
+        const double area = cv::contourArea(contour);
+        if (area < minDim * minDim * 0.035) {
+            continue;
+        }
+
+        const cv::RotatedRect ellipse = cv::fitEllipse(contour);
+        const double semiMajor = std::max(ellipse.size.width, ellipse.size.height) * 0.5;
+        const double semiMinor = std::min(ellipse.size.width, ellipse.size.height) * 0.5;
+        if (semiMinor < holeRadius * 1.05 || semiMajor > minDim * 0.68) {
+            continue;
+        }
+
+        const double centerDistance = cv::norm(ellipse.center - center) / std::max(1.0, static_cast<double>(minDim));
+        const double meanRadius = 0.5 * (semiMajor + semiMinor);
+        const double radiusDistance = std::abs(meanRadius - targetRadius) / std::max(10.0, static_cast<double>(targetRadius));
+        const double eccentricityPenalty = std::abs(semiMajor - semiMinor) / std::max(1.0, semiMajor);
+        const double score = 2.4 - centerDistance * 3.5 - radiusDistance * 2.0 - eccentricityPenalty * 0.4;
+        if (score > bestScore) {
+            bestScore = score;
+            bestEllipse = ellipse;
+        }
+    }
+
+    return bestEllipse;
+}
+
+bool fitWheelFromIsolatedForeground(const cv::Mat& blurred,
+                                    const cv::Point2f& imageCenter,
+                                    cv::Point2f& outCenter,
+                                    float& outHoleRadius,
+                                    float& outOuterRadius,
+                                    cv::RotatedRect& outInnerEllipse,
+                                    cv::RotatedRect& outOuterEllipse,
+                                    cv::Rect& outRect) {
+    if (blurred.empty()) {
+        return false;
+    }
+
+    cv::Mat objectMask;
+    cv::threshold(blurred, objectMask, 245, 255, cv::THRESH_BINARY_INV);
+    cv::morphologyEx(objectMask,
+                     objectMask,
+                     cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                               cv::Size(std::max(7, blurred.cols / 80),
+                                                        std::max(7, blurred.rows / 80))));
+    cv::morphologyEx(objectMask,
+                     objectMask,
+                     cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                               cv::Size(std::max(3, blurred.cols / 180),
+                                                        std::max(3, blurred.rows / 180))));
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(objectMask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (contours.empty()) {
+        return false;
+    }
+
+    double bestOuterScore = -1.0;
+    std::vector<cv::Point> bestOuterContour;
+    cv::RotatedRect bestOuter;
+    for (const auto& contour : contours) {
+        if (contour.size() < 5) {
+            continue;
+        }
+        const double area = cv::contourArea(contour);
+        if (area < blurred.cols * blurred.rows * 0.12) {
+            continue;
+        }
+        const cv::RotatedRect ellipse = cv::fitEllipse(contour);
+        const double centerDistance = cv::norm(ellipse.center - imageCenter) /
+                                      std::max(1.0, static_cast<double>(std::min(blurred.cols, blurred.rows)));
+        const double score = area / std::max(1.0, static_cast<double>(blurred.cols * blurred.rows)) - centerDistance * 0.4;
+        if (score > bestOuterScore) {
+            bestOuterScore = score;
+            bestOuterContour = contour;
+            bestOuter = ellipse;
+        }
+    }
+    if (bestOuterScore < 0.0) {
+        return false;
+    }
+
+    cv::Mat holeMask;
+    cv::threshold(blurred, holeMask, 245, 255, cv::THRESH_BINARY);
+    cv::Mat innerRegionMask = cv::Mat::zeros(blurred.size(), CV_8UC1);
+    cv::ellipse(innerRegionMask,
+                bestOuter,
+                cv::Scalar(255),
+                cv::FILLED,
+                cv::LINE_AA);
+    cv::bitwise_and(holeMask, innerRegionMask, holeMask);
+    cv::morphologyEx(holeMask,
+                     holeMask,
+                     cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                               cv::Size(std::max(3, blurred.cols / 180),
+                                                        std::max(3, blurred.rows / 180))));
+    cv::morphologyEx(holeMask,
+                     holeMask,
+                     cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                               cv::Size(std::max(5, blurred.cols / 120),
+                                                        std::max(5, blurred.rows / 120))));
+
+    std::vector<std::vector<cv::Point>> holeContours;
+    cv::findContours(holeMask, holeContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    double bestInnerScore = -1.0;
+    cv::RotatedRect bestInner;
+    for (const auto& contour : holeContours) {
+        if (contour.size() < 5) {
+            continue;
+        }
+        const double area = cv::contourArea(contour);
+        if (area < bestOuter.size.area() * 0.08 || area > bestOuter.size.area() * 0.8) {
+            continue;
+        }
+        const cv::RotatedRect ellipse = cv::fitEllipse(contour);
+        const double centerDistance = cv::norm(ellipse.center - bestOuter.center) /
+                                      std::max(1.0, static_cast<double>(std::min(blurred.cols, blurred.rows)));
+        const double score = area / std::max(1.0, static_cast<double>(bestOuter.size.area())) - centerDistance * 0.6;
+        if (score > bestInnerScore) {
+            bestInnerScore = score;
+            bestInner = ellipse;
+        }
+    }
+    if (bestInnerScore < 0.0) {
+        return false;
+    }
+
+    outOuterEllipse = bestOuter;
+    outInnerEllipse = bestInner;
+    outCenter = bestOuter.center;
+    outOuterRadius = static_cast<float>(0.25 * (bestOuter.size.width + bestOuter.size.height));
+    outHoleRadius = static_cast<float>(0.25 * (bestInner.size.width + bestInner.size.height));
+    outRect = cv::boundingRect(bestOuterContour);
+    return true;
+}
+
+bool estimateOuterCircleWithReducedHough(const cv::Mat& blurred,
+                                         const cv::Point2f& preferredCenter,
+                                         float preferredRadius,
+                                         cv::Point2f& outCenter,
+                                         float& outRadius,
+                                         double& elapsedMsOut) {
+    const Clock::time_point start = Clock::now();
+    if (blurred.empty()) {
+        elapsedMsOut = 0.0;
+        return false;
+    }
+
+    const int maxDim = std::max(blurred.cols, blurred.rows);
+    const double downscale = maxDim > 640 ? 640.0 / static_cast<double>(maxDim) : 1.0;
+    cv::Mat small;
+    if (downscale < 0.999) {
+        cv::resize(blurred, small, cv::Size(), downscale, downscale, cv::INTER_AREA);
+    } else {
+        small = blurred;
+    }
+
+    const cv::Point2f scaledCenter(preferredCenter.x * static_cast<float>(downscale),
+                                   preferredCenter.y * static_cast<float>(downscale));
+    const float scaledRadius = preferredRadius * static_cast<float>(downscale);
+    const int roiHalfSize = std::max(120, cvRound(scaledRadius * 1.18F));
+    const int roiX = std::clamp(cvRound(scaledCenter.x) - roiHalfSize, 0, std::max(0, small.cols - 1));
+    const int roiY = std::clamp(cvRound(scaledCenter.y) - roiHalfSize, 0, std::max(0, small.rows - 1));
+    const int roiW = std::min(small.cols - roiX, std::max(1, roiHalfSize * 2));
+    const int roiH = std::min(small.rows - roiY, std::max(1, roiHalfSize * 2));
+    const cv::Rect roi(roiX, roiY, roiW, roiH);
+
+    cv::Mat roiBlur = small(roi).clone();
+    cv::GaussianBlur(roiBlur, roiBlur, cv::Size(7, 7), 0.0);
+
+    std::vector<cv::Vec3f> circles;
+    const int minRadius = std::max(20, cvRound(scaledRadius * 0.78F));
+    const int maxRadius = std::max(minRadius + 5, cvRound(scaledRadius * 1.18F));
+    cv::HoughCircles(roiBlur,
+                     circles,
+                     cv::HOUGH_GRADIENT,
+                     1.2,
+                     std::max(40.0, scaledRadius * 0.6),
+                     100.0,
+                     24.0,
+                     minRadius,
+                     maxRadius);
+
+    elapsedMsOut = elapsedMs(start, Clock::now());
+    if (circles.empty()) {
+        return false;
+    }
+
+    double bestScore = -1.0;
+    cv::Vec3f bestCircle = circles.front();
+    for (const auto& circle : circles) {
+        const cv::Point2f center(circle[0] + static_cast<float>(roi.x),
+                                 circle[1] + static_cast<float>(roi.y));
+        const double centerDistance = cv::norm(center - scaledCenter) / std::max(1.0F, scaledRadius);
+        const double radiusDistance = std::abs(circle[2] - scaledRadius) / std::max(1.0F, scaledRadius);
+        const double score = 2.0 - centerDistance * 1.5 - radiusDistance;
+        if (score > bestScore) {
+            bestScore = score;
+            bestCircle = circle;
+        }
+    }
+
+    outCenter = cv::Point2f((bestCircle[0] + static_cast<float>(roi.x)) / static_cast<float>(downscale),
+                            (bestCircle[1] + static_cast<float>(roi.y)) / static_cast<float>(downscale));
+    outRadius = bestCircle[2] / static_cast<float>(downscale);
+    return true;
+}
+
 }  // namespace
 
 cv::Mat ImagePreprocessor::toGrayscale(const cv::Mat& input) const {
@@ -188,6 +488,25 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
     const cv::Point2f imageCenter(static_cast<float>(blurred.cols) * 0.5F,
                                   static_cast<float>(blurred.rows) * 0.5F);
 
+    cv::Mat holeMask;
+    cv::threshold(blurred, holeMask, 70, 255, cv::THRESH_BINARY_INV);
+    holeMask = morphologyOpen(holeMask, std::max(3, blurred.cols / 180), std::max(3, blurred.rows / 180));
+    holeMask = morphologyClose(holeMask, std::max(7, blurred.cols / 90), std::max(7, blurred.rows / 90));
+
+    cv::Mat centerBiasMask = cv::Mat::zeros(blurred.size(), CV_8UC1);
+    const cv::Size axes(std::max(8, static_cast<int>(std::round(blurred.cols * 0.34))),
+                        std::max(8, static_cast<int>(std::round(blurred.rows * 0.34))));
+    cv::ellipse(centerBiasMask,
+                imageCenter,
+                axes,
+                0.0,
+                0.0,
+                360.0,
+                cv::Scalar(255),
+                cv::FILLED,
+                cv::LINE_AA);
+    cv::bitwise_and(holeMask, centerBiasMask, holeMask);
+
     const Clock::time_point contourStart = Clock::now();
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(darkMask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
@@ -198,8 +517,72 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
     double bestScore = -1.0;
     cv::Point2f bestCenter;
     float bestRadius = 0.0F;
+    float bestHoleRadius = 0.0F;
+    cv::RotatedRect bestInnerEllipse;
     cv::Rect bestRect;
     int bestContourIndex = -1;
+
+    std::vector<std::vector<cv::Point>> holeContours;
+    cv::findContours(holeMask, holeContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    cv::Point2f isolatedCenter;
+    float isolatedHoleRadius = 0.0F;
+    float isolatedOuterRadius = 0.0F;
+    cv::RotatedRect isolatedInnerEllipse;
+    cv::RotatedRect isolatedOuterEllipse;
+    cv::Rect isolatedRect;
+    if (fitWheelFromIsolatedForeground(blurred,
+                                       imageCenter,
+                                       isolatedCenter,
+                                       isolatedHoleRadius,
+                                       isolatedOuterRadius,
+                                       isolatedInnerEllipse,
+                                       isolatedOuterEllipse,
+                                       isolatedRect)) {
+        bestScore = 10.0;
+        bestCenter = isolatedCenter;
+        bestHoleRadius = isolatedHoleRadius;
+        bestRadius = isolatedOuterRadius;
+        bestInnerEllipse = isolatedInnerEllipse;
+        bestRect = isolatedRect;
+        bestContourIndex = -1;
+    }
+
+    for (const auto& contour : holeContours) {
+        const double area = cv::contourArea(contour);
+        if (area < minDim * minDim * 0.015 || area > minDim * minDim * 0.24) {
+            continue;
+        }
+
+        cv::Point2f center;
+        float radius = 0.0F;
+        cv::minEnclosingCircle(contour, center, radius);
+        if (radius < minDim * 0.12F || radius > minDim * 0.42F) {
+            continue;
+        }
+
+        const cv::Rect rect = cv::boundingRect(contour);
+        const double aspect = static_cast<double>(rect.width) / std::max(1, rect.height);
+        if (aspect < 0.75 || aspect > 1.25) {
+            continue;
+        }
+
+        const double centerDistance = cv::norm(center - imageCenter) / std::max(1.0, static_cast<double>(minDim));
+        const double fillRatio = area / std::max(1.0, CV_PI * radius * radius);
+        const double normalizedRadius = radius / std::max(1.0, static_cast<double>(minDim));
+        const double score = normalizedRadius * 1.4 + fillRatio * 1.6 - centerDistance * 1.8;
+        if (score > bestScore) {
+            const float refinedOuterRadius = refineOuterRadiusFromEdges(blurred, center, radius, minDim);
+            bestScore = score;
+            bestCenter = center;
+            bestHoleRadius = radius;
+            bestRadius = refinedOuterRadius > 0.0F ? refinedOuterRadius : radius / 0.72F;
+            bestInnerEllipse = contour.size() >= 5 ? cv::fitEllipse(contour) : ellipseFromCircle(center, radius);
+            bestRect = cv::Rect(cvRound(center.x - bestRadius), cvRound(center.y - bestRadius),
+                                cvRound(bestRadius * 2.0F), cvRound(bestRadius * 2.0F));
+            bestContourIndex = -1;
+        }
+    }
 
     for (std::size_t i = 0; i < contours.size(); ++i) {
         const double area = cv::contourArea(contours[i]);
@@ -228,43 +611,44 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
             bestScore = score;
             bestCenter = center;
             bestRadius = radius;
+            bestHoleRadius = radius * 0.68F;
+            bestInnerEllipse = ellipseFromCircle(center, bestHoleRadius);
             bestRect = rect;
             bestContourIndex = static_cast<int>(i);
         }
     }
 
     std::vector<cv::Vec3f> circles;
-    if (bestContourIndex < 0) {
-        const Clock::time_point houghStart = Clock::now();
-        cv::HoughCircles(blurred,
-                         circles,
-                         cv::HOUGH_GRADIENT,
-                         1.5,
-                         minDim / 6.0,
-                         100.0,
-                         36.0,
-                         static_cast<int>(minDim * 0.22),
-                         static_cast<int>(minDim * 0.52));
-        if (timings != nullptr) {
-            timings->push_back({"wheel_hough_ms", elapsedMs(houghStart, Clock::now())});
-        }
-
-        for (const auto& circle : circles) {
-            const cv::Point2f center(circle[0], circle[1]);
-            const float radius = circle[2];
-            const double centerDistance = cv::norm(center - imageCenter) / std::max(1.0, static_cast<double>(minDim));
-            const double normalizedRadius = radius / std::max(1.0, static_cast<double>(minDim));
-            const double score = normalizedRadius * 2.0 - centerDistance;
-            if (score > bestScore) {
+    double reducedHoughMs = 0.0;
+    const bool shouldTryReducedHough = false;
+    if (shouldTryReducedHough) {
+        cv::Point2f houghCenter = bestHoleRadius > 0.0F ? bestCenter : imageCenter;
+        float houghRadius = bestRadius > 0.0F ? bestRadius : static_cast<float>(minDim) * 0.42F;
+        cv::Point2f refinedCenter;
+        float refinedRadius = 0.0F;
+        if (estimateOuterCircleWithReducedHough(blurred, houghCenter, houghRadius, refinedCenter, refinedRadius, reducedHoughMs)) {
+            const double centerDistance =
+                cv::norm(refinedCenter - (bestHoleRadius > 0.0F ? bestCenter : imageCenter)) /
+                std::max(1.0F, bestHoleRadius > 0.0F ? bestHoleRadius : refinedRadius);
+            const double radiusDistance =
+                std::abs(refinedRadius - (bestRadius > 0.0F ? bestRadius : refinedRadius)) /
+                std::max(1.0F, bestRadius > 0.0F ? bestRadius : refinedRadius);
+            const double score = 2.4 - centerDistance * 1.2 - radiusDistance * 0.8;
+            if (score > bestScore - 0.1) {
                 bestScore = score;
-                bestCenter = center;
-                bestRadius = radius;
-                bestRect = cv::Rect(cvRound(center.x - radius), cvRound(center.y - radius),
-                                    cvRound(radius * 2.0F), cvRound(radius * 2.0F));
+                bestCenter = refinedCenter;
+                bestRadius = refinedRadius;
+                if (bestHoleRadius <= 0.0F) {
+                    bestHoleRadius = refinedRadius * 0.68F;
+                }
+                bestInnerEllipse = ellipseFromCircle(bestCenter, bestHoleRadius);
+                bestRect = cv::Rect(cvRound(bestCenter.x - bestRadius), cvRound(bestCenter.y - bestRadius),
+                                    cvRound(bestRadius * 2.0F), cvRound(bestRadius * 2.0F));
             }
         }
-    } else if (timings != nullptr) {
-        timings->push_back({"wheel_hough_ms", 0.0});
+    }
+    if (timings != nullptr) {
+        timings->push_back({"wheel_hough_ms", reducedHoughMs});
     }
 
     if (bestScore < 0.0 || bestRadius <= 0.0F) {
@@ -275,8 +659,37 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
     geometry.center = cv::Point2f(bestCenter.x / static_cast<float>(scale),
                                   bestCenter.y / static_cast<float>(scale));
     geometry.radius = bestRadius / static_cast<float>(scale);
-    geometry.innerRadius = geometry.radius * 0.68F;
+    const float scaledHoleRadius = bestHoleRadius > 0.0F ? (bestHoleRadius / static_cast<float>(scale))
+                                                          : (geometry.radius * 0.68F);
+    geometry.innerRadius = scaledHoleRadius * 1.02F;
     geometry.outerRadius = geometry.radius * 0.98F;
+    if (bestInnerEllipse.size.width > 0.0F && bestInnerEllipse.size.height > 0.0F) {
+        geometry.innerEllipse = cv::RotatedRect(
+            cv::Point2f(bestInnerEllipse.center.x / static_cast<float>(scale),
+                        bestInnerEllipse.center.y / static_cast<float>(scale)),
+            cv::Size2f(bestInnerEllipse.size.width / static_cast<float>(scale),
+                       bestInnerEllipse.size.height / static_cast<float>(scale)),
+            bestInnerEllipse.angle);
+    } else {
+        geometry.innerEllipse = ellipseFromCircle(geometry.center, geometry.innerRadius);
+    }
+
+    cv::RotatedRect bestOuterEllipseResized =
+        fitBestOuterEllipse(contours, bestCenter, bestRadius, bestHoleRadius, minDim);
+    if (isolatedOuterEllipse.size.width > 0.0F && isolatedOuterEllipse.size.height > 0.0F &&
+        bestScore >= 9.5) {
+        bestOuterEllipseResized = isolatedOuterEllipse;
+    }
+    geometry.outerEllipse = cv::RotatedRect(
+        cv::Point2f(bestOuterEllipseResized.center.x / static_cast<float>(scale),
+                    bestOuterEllipseResized.center.y / static_cast<float>(scale)),
+        cv::Size2f(bestOuterEllipseResized.size.width / static_cast<float>(scale),
+                   bestOuterEllipseResized.size.height / static_cast<float>(scale)),
+        bestOuterEllipseResized.angle);
+    geometry.center = geometry.outerEllipse.center;
+    geometry.outerRadius = static_cast<float>(
+        0.25 * (geometry.outerEllipse.size.width + geometry.outerEllipse.size.height));
+    geometry.radius = geometry.outerRadius;
     geometry.bounds = cv::Rect(
         std::max(0, static_cast<int>(std::floor(geometry.center.x - geometry.outerRadius))),
         std::max(0, static_cast<int>(std::floor(geometry.center.y - geometry.outerRadius))),
@@ -289,31 +702,32 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
         if (bestContourIndex >= 0) {
             cv::drawContours(contourOverlay, contours, bestContourIndex, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
         }
+        for (const auto& contour : holeContours) {
+            cv::drawContours(contourOverlay, std::vector<std::vector<cv::Point>>{contour}, -1, cv::Scalar(255, 128, 0), 1, cv::LINE_AA);
+        }
         cv::rectangle(contourOverlay, bestRect, cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
         cv::circle(contourOverlay, bestCenter, cvRound(bestRadius), cv::Scalar(0, 255, 0), 3, cv::LINE_AA);
+        if (bestInnerEllipse.size.width > 0.0F && bestInnerEllipse.size.height > 0.0F) {
+            cv::ellipse(contourOverlay, bestInnerEllipse, cv::Scalar(255, 0, 0), 2, cv::LINE_AA);
+        }
         debugImages->contourOverlay = contourOverlay;
 
         cv::Mat circlesOverlay;
         cv::cvtColor(resizedGray, circlesOverlay, cv::COLOR_GRAY2BGR);
-        for (const auto& circle : circles) {
-            cv::circle(circlesOverlay,
-                       cv::Point(cvRound(circle[0]), cvRound(circle[1])),
-                       cvRound(circle[2]),
-                       cv::Scalar(255, 200, 0),
-                       2,
-                       cv::LINE_AA);
-        }
         cv::circle(circlesOverlay,
                    bestCenter,
                    cvRound(bestRadius),
                    cv::Scalar(0, 255, 0),
                    3,
                    cv::LINE_AA);
+        if (bestOuterEllipseResized.size.width > 0.0F && bestOuterEllipseResized.size.height > 0.0F) {
+            cv::ellipse(circlesOverlay, bestOuterEllipseResized, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        }
         debugImages->circlesOverlay = circlesOverlay;
 
         cv::Mat annulusOverlay = image.clone();
-        cv::circle(annulusOverlay, geometry.center, cvRound(geometry.outerRadius), cv::Scalar(0, 255, 0), 3, cv::LINE_AA);
-        cv::circle(annulusOverlay, geometry.center, cvRound(geometry.innerRadius), cv::Scalar(0, 140, 255), 3, cv::LINE_AA);
+        cv::ellipse(annulusOverlay, geometry.outerEllipse, cv::Scalar(0, 255, 0), 3, cv::LINE_AA);
+        cv::ellipse(annulusOverlay, geometry.innerEllipse, cv::Scalar(0, 140, 255), 3, cv::LINE_AA);
         debugImages->annulusOverlay = annulusOverlay;
     }
 

@@ -25,4 +25,7 @@ runs/
 __pycache__/
 *.pt
 .venv-yolo/
+.venv-ocr/
 out-fast-*/
+out-yolo-*/
+third_party/onnxruntime/onnxruntime-linux-x64-*.tgz

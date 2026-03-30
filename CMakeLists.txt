@@ -13,6 +13,20 @@ if(TYRE_READER_BUILD_CORE)
     find_package(OpenCV QUIET COMPONENTS core imgproc imgcodecs)
     find_package(PkgConfig QUIET)
 
+    set(TYRE_READER_ONNXRUNTIME_AVAILABLE OFF)
+    set(TYRE_READER_ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime")
+    set(TYRE_READER_ONNXRUNTIME_INCLUDE "${TYRE_READER_ONNXRUNTIME_ROOT}/include")
+    set(TYRE_READER_ONNXRUNTIME_LIB "${TYRE_READER_ONNXRUNTIME_ROOT}/lib/libonnxruntime.so")
+    if(EXISTS "${TYRE_READER_ONNXRUNTIME_INCLUDE}/onnxruntime_cxx_api.h" AND
+       EXISTS "${TYRE_READER_ONNXRUNTIME_LIB}")
+        add_library(tyre_reader_onnxruntime SHARED IMPORTED)
+        set_target_properties(tyre_reader_onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${TYRE_READER_ONNXRUNTIME_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${TYRE_READER_ONNXRUNTIME_INCLUDE}"
+        )
+        set(TYRE_READER_ONNXRUNTIME_AVAILABLE ON)
+    endif()
+
     set(TYRE_READER_CORE_AVAILABLE OFF)
     if(OpenCV_FOUND AND PkgConfig_FOUND)
         pkg_check_modules(TESSERACT QUIET IMPORTED_TARGET tesseract)
@@ -43,6 +57,14 @@ if(TYRE_READER_BUILD_CORE)
                 PkgConfig::LEPTONICA
         )
 
+        if(TYRE_READER_ONNXRUNTIME_AVAILABLE)
+            target_link_libraries(tyre_reader_core PUBLIC tyre_reader_onnxruntime)
+            target_compile_definitions(tyre_reader_core PRIVATE TYRE_READER_WITH_ONNXRUNTIME=1)
+            set_target_properties(tyre_reader_core PROPERTIES
+                BUILD_RPATH "${TYRE_READER_ONNXRUNTIME_ROOT}/lib"
+            )
+        endif()
+
         add_executable(tyre_reader_v3
             src/main.cpp
         )
@@ -51,6 +73,12 @@ if(TYRE_READER_BUILD_CORE)
             PRIVATE
                 tyre_reader_core
         )
+
+        if(TYRE_READER_ONNXRUNTIME_AVAILABLE)
+            set_target_properties(tyre_reader_v3 PROPERTIES
+                BUILD_RPATH "${TYRE_READER_ONNXRUNTIME_ROOT}/lib"
+            )
+        endif()
 
         add_executable(tyre_dataset_prep
             src/DatasetImagePreprocessor.cpp
