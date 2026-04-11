@@ -116,6 +116,141 @@ cv::Mat cropUnwrappedSector(const cv::Mat& sidewall, double startAngleDeg, doubl
     return extended(cv::Rect(x0, 0, x1 - x0, extended.rows)).clone();
 }
 
+cv::Rect tightenTextBandRect(const cv::Mat& image, bool dotMode) {
+    if (image.empty()) {
+        return {};
+    }
+
+    cv::Mat gray;
+    if (image.channels() == 1) {
+        gray = image;
+    } else {
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    }
+
+    cv::Mat clahe;
+    auto claheOp = cv::createCLAHE(3.0, cv::Size(8, 8));
+    claheOp->apply(gray, clahe);
+
+    cv::Mat focus = clahe;
+    int focusYOffset = 0;
+    if (!dotMode) {
+        const int focusHeight = std::max(1, static_cast<int>(std::round(image.rows * 0.68)));
+        focus = clahe(cv::Rect(0, 0, clahe.cols, focusHeight)).clone();
+    }
+
+    cv::Mat blackhat;
+    const cv::Size kernelSize(dotMode ? 15 : 31, dotMode ? 5 : 9);
+    cv::morphologyEx(focus,
+                     blackhat,
+                     cv::MORPH_BLACKHAT,
+                     cv::getStructuringElement(cv::MORPH_RECT, kernelSize));
+
+    cv::Mat binary;
+    cv::threshold(blackhat, binary, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    cv::morphologyEx(binary,
+                     binary,
+                     cv::MORPH_CLOSE,
+                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(dotMode ? 9 : 21, 3)));
+
+    std::vector<double> rowEnergy(static_cast<std::size_t>(binary.rows), 0.0);
+    std::vector<double> colEnergy(static_cast<std::size_t>(binary.cols), 0.0);
+    for (int y = 0; y < binary.rows; ++y) {
+        rowEnergy[static_cast<std::size_t>(y)] = cv::sum(binary.row(y))[0] / 255.0;
+    }
+    for (int x = 0; x < binary.cols; ++x) {
+        colEnergy[static_cast<std::size_t>(x)] = cv::sum(binary.col(x))[0] / 255.0;
+    }
+
+    auto bestRange = [](const std::vector<double>& energy, int minSpan, int maxSpan) -> std::pair<int, int> {
+        if (energy.empty()) {
+            return {0, 0};
+        }
+        double bestScore = -1.0;
+        int bestStart = 0;
+        int bestEnd = static_cast<int>(energy.size());
+        std::vector<double> prefix(energy.size() + 1, 0.0);
+        for (std::size_t i = 0; i < energy.size(); ++i) {
+            prefix[i + 1] = prefix[i] + energy[i];
+        }
+        minSpan = std::max(1, minSpan);
+        maxSpan = std::max(minSpan, maxSpan);
+        for (int start = 0; start < static_cast<int>(energy.size()); ++start) {
+            const int endMax = std::min(static_cast<int>(energy.size()), start + maxSpan);
+            for (int end = start + minSpan; end <= endMax; ++end) {
+                const double score = prefix[static_cast<std::size_t>(end)] - prefix[static_cast<std::size_t>(start)];
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestStart = start;
+                    bestEnd = end;
+                }
+            }
+        }
+        return {bestStart, bestEnd};
+    };
+
+    const int effectiveRows = binary.rows;
+    const int effectiveCols = binary.cols;
+    const int minRowSpan = dotMode ? std::max(12, effectiveRows / 8) : std::max(22, effectiveRows / 4);
+    const int maxRowSpan = dotMode ? std::max(minRowSpan + 8, effectiveRows / 2)
+                                   : std::max(minRowSpan + 12, (effectiveRows * 3) / 5);
+    auto rowRange = bestRange(rowEnergy, minRowSpan, maxRowSpan);
+
+    int x0 = 0;
+    int x1 = image.cols;
+    int y0 = std::max(0, rowRange.first - (dotMode ? 6 : 12)) + focusYOffset;
+    int y1 = std::min(focus.rows, rowRange.second + (dotMode ? 6 : 10)) + focusYOffset;
+
+    if (dotMode) {
+        const int minColSpan = std::max(50, effectiveCols / 6);
+        const int maxColSpan = std::max(minColSpan + 40, (effectiveCols * 3) / 4);
+        auto colRange = bestRange(colEnergy, minColSpan, maxColSpan);
+        x0 = std::max(0, colRange.first - 12);
+        x1 = std::min(image.cols, colRange.second + 12);
+        if (x1 - x0 < minColSpan) {
+            x0 = 0;
+            x1 = image.cols;
+        }
+    } else {
+        const cv::Rect rowRect(0, std::max(0, rowRange.first - 4), binary.cols,
+                               std::max(1, std::min(binary.rows, rowRange.second + 4) - std::max(0, rowRange.first - 4)));
+        const cv::Mat rowBand = binary(rowRect);
+        std::vector<double> topColEnergy(static_cast<std::size_t>(rowBand.cols), 0.0);
+        for (int x = 0; x < rowBand.cols; ++x) {
+            topColEnergy[static_cast<std::size_t>(x)] = cv::sum(rowBand.col(x))[0] / 255.0;
+        }
+        const int minColSpan = std::max(140, effectiveCols / 2);
+        const int maxColSpan = image.cols;
+        auto colRange = bestRange(topColEnergy, minColSpan, maxColSpan);
+        if (colRange.second - colRange.first >= minColSpan) {
+            x0 = std::max(0, colRange.first - 18);
+            x1 = std::min(image.cols, colRange.second + 18);
+        }
+        y1 = std::min(image.rows, std::max(y1, static_cast<int>(std::round(image.rows * 0.58))));
+    }
+
+    if (y1 - y0 < minRowSpan) {
+        y0 = 0;
+        y1 = std::min(image.rows, dotMode ? image.rows : std::max(1, static_cast<int>(std::round(image.rows * 0.60))));
+    }
+
+    return cv::Rect(x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0));
+}
+
+cv::Mat upscaleIfSmall(const cv::Mat& image, bool dotMode) {
+    if (image.empty()) {
+        return {};
+    }
+    const int targetHeight = dotMode ? 180 : 140;
+    if (image.rows >= targetHeight) {
+        return image.clone();
+    }
+    const double scale = static_cast<double>(targetHeight) / std::max(1, image.rows);
+    cv::Mat resized;
+    cv::resize(image, resized, cv::Size(), scale, scale, cv::INTER_CUBIC);
+    return resized;
+}
+
 struct LetterboxTransform {
     cv::Mat image;
     double scale = 1.0;
@@ -286,7 +421,7 @@ RoiOcrResult TyreAnalyzer::recognizeRoiFile(const std::string& imagePath,
 
     const Clock::time_point variantStart = Clock::now();
     std::vector<std::pair<std::string, cv::Mat>> roiCandidates;
-    if (!isDot && crop.rows >= 120) {
+    if (!isDot && crop.rows >= 90) {
         const int h = crop.rows;
         const int w = crop.cols;
         const auto makeBand = [&](const std::string& name, double y0Ratio, double y1Ratio) {
@@ -294,10 +429,8 @@ RoiOcrResult TyreAnalyzer::recognizeRoiFile(const std::string& imagePath,
             const int y1 = std::clamp(static_cast<int>(std::round(h * y1Ratio)), y0 + 1, h);
             roiCandidates.emplace_back(name, crop(cv::Rect(0, y0, w, y1 - y0)).clone());
         };
-        makeBand("mid50", 0.18, 0.68);
-        makeBand("top55", 0.00, 0.55);
-        makeBand("top70", 0.00, 0.70);
-        makeBand("upper_mid", 0.10, 0.72);
+        makeBand("top60", 0.00, 0.60);
+        makeBand("top75", 0.00, 0.75);
     }
     roiCandidates.emplace_back("full", crop);
     appendTiming(result.stepTimings, "variants_build_ms", elapsedMs(variantStart, Clock::now()));
@@ -306,8 +439,8 @@ RoiOcrResult TyreAnalyzer::recognizeRoiFile(const std::string& imagePath,
     bool shouldStop = false;
     for (const auto& roiCandidate : roiCandidates) {
         auto variants = buildFastVariants(roiCandidate.second, isDot);
-        if (variants.size() > 4) {
-            variants.resize(4);
+        if (variants.size() > (isDot ? 4 : 3)) {
+            variants.resize(isDot ? 4 : 3);
         }
         for (const auto& variant : variants) {
             const std::vector<std::pair<std::string, tesseract::PageSegMode>> modes = {
@@ -591,10 +724,16 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     result.yoloDetections = yoloRun.detections;
     result.notes.insert(result.notes.end(), yoloRun.notes.begin(), yoloRun.notes.end());
 
-    cv::Rect bestSizeBox;
-    double bestSizeScore = -1.0;
-    cv::Rect bestDotBox;
-    double bestDotScore = -1.0;
+    struct RankedYoloCandidate {
+        cv::Rect box;
+        double score = 0.0;
+        std::string label;
+    };
+
+    std::vector<RankedYoloCandidate> sizeCandidatesPrimary;
+    std::vector<RankedYoloCandidate> sizeCandidatesFallback;
+    std::vector<RankedYoloCandidate> dotCandidatesPrimary;
+    std::vector<RankedYoloCandidate> dotCandidatesFallback;
 
     for (auto& detection : result.yoloDetections) {
         detection.box = clampRect(detection.box, frame.size());
@@ -606,29 +745,86 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
         if (wheelGeometry.found) {
             annulusScore = computeAnnulusCompatibility(detection.box, wheelGeometry);
         }
-        const bool semanticMatch = label == "SIZE" || label == "DOT";
-        detection.acceptedForOcr = semanticMatch && (!wheelGeometry.found || annulusScore >= 0.34);
-        const double combinedScore = detection.confidence * (wheelGeometry.found ? annulusScore : 1.0);
-        if (!detection.acceptedForOcr) {
+        const bool annulusOkay = (!wheelGeometry.found || annulusScore >= 0.34);
+        if (!annulusOkay) {
+            detection.acceptedForOcr = false;
             continue;
         }
-        if (label == "SIZE" && combinedScore > bestSizeScore) {
-            bestSizeScore = combinedScore;
-            bestSizeBox = detection.box;
-        } else if (label == "DOT" && combinedScore > bestDotScore) {
-            bestDotScore = combinedScore;
-            bestDotBox = detection.box;
+
+        const double sizeAffinity =
+            label == "SIZE" ? 1.00 :
+            (label == "MODEL" ? 0.72 :
+             (label == "BRAND" ? 0.56 :
+              (label == "DOT" ? 0.10 : 0.0)));
+        const double dotAffinity =
+            label == "DOT" ? 1.00 :
+            (label == "MODEL" ? 0.12 :
+             (label == "BRAND" ? 0.08 :
+              (label == "SIZE" ? 0.05 : 0.0)));
+
+        detection.acceptedForOcr = sizeAffinity > 0.0 || dotAffinity > 0.0;
+
+        const double combinedBaseScore = detection.confidence * (wheelGeometry.found ? annulusScore : 1.0);
+        if (label == "SIZE") {
+            sizeCandidatesPrimary.push_back({detection.box, combinedBaseScore * sizeAffinity, label});
+        } else if (sizeAffinity > 0.0) {
+            sizeCandidatesFallback.push_back({detection.box, combinedBaseScore * sizeAffinity, label});
+        }
+        if (label == "DOT") {
+            dotCandidatesPrimary.push_back({detection.box, combinedBaseScore * dotAffinity, label});
+        } else if (dotAffinity > 0.0) {
+            dotCandidatesFallback.push_back({detection.box, combinedBaseScore * dotAffinity, label});
         }
     }
+
+    auto pruneCandidates = [](std::vector<RankedYoloCandidate>& candidates, std::size_t limit) {
+        std::sort(candidates.begin(), candidates.end(), [](const RankedYoloCandidate& lhs, const RankedYoloCandidate& rhs) {
+            return lhs.score > rhs.score;
+        });
+
+        std::vector<RankedYoloCandidate> filtered;
+        for (const auto& candidate : candidates) {
+            bool overlapsTooMuch = false;
+            for (const auto& kept : filtered) {
+                if (intersectionOverUnion(candidate.box, kept.box) > 0.65) {
+                    overlapsTooMuch = true;
+                    break;
+                }
+            }
+            if (!overlapsTooMuch) {
+                filtered.push_back(candidate);
+            }
+            if (filtered.size() >= limit) {
+                break;
+            }
+        }
+        candidates = std::move(filtered);
+    };
+
+    pruneCandidates(sizeCandidatesPrimary, 2);
+    pruneCandidates(sizeCandidatesFallback, 1);
+    pruneCandidates(dotCandidatesPrimary, 2);
+    pruneCandidates(dotCandidatesFallback, 1);
+
+    std::vector<RankedYoloCandidate> sizeCandidates =
+        !sizeCandidatesPrimary.empty() ? sizeCandidatesPrimary : sizeCandidatesFallback;
+    std::vector<RankedYoloCandidate> dotCandidates =
+        !dotCandidatesPrimary.empty() ? dotCandidatesPrimary : dotCandidatesFallback;
     if (saveDebugArtifacts_) {
         cv::Mat yoloSelected = frame.clone();
         for (const auto& detection : result.yoloDetections) {
-            const cv::Scalar color = normalizeForComparison(detection.label) == "SIZE"
-                                         ? (detection.acceptedForOcr ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 120, 0))
-                                         : (normalizeForComparison(detection.label) == "DOT"
-                                                ? (detection.acceptedForOcr ? cv::Scalar(0, 140, 255) : cv::Scalar(0, 70, 140))
+            const bool selectedForSize = std::any_of(sizeCandidates.begin(), sizeCandidates.end(), [&](const RankedYoloCandidate& candidate) {
+                return candidate.box == detection.box;
+            });
+            const bool selectedForDot = std::any_of(dotCandidates.begin(), dotCandidates.end(), [&](const RankedYoloCandidate& candidate) {
+                return candidate.box == detection.box;
+            });
+            const cv::Scalar color = selectedForSize
+                                         ? cv::Scalar(0, 255, 0)
+                                         : (selectedForDot
+                                                ? cv::Scalar(0, 140, 255)
                                                 : cv::Scalar(180, 180, 180));
-            const int thickness = detection.acceptedForOcr ? 3 : 1;
+            const int thickness = (selectedForSize || selectedForDot) ? 3 : 1;
             cv::rectangle(yoloSelected, detection.box, color, thickness, cv::LINE_AA);
             cv::putText(yoloSelected,
                         detection.label + " " + formatDouble(detection.confidence, 2),
@@ -669,6 +865,22 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
             return false;
         }
 
+        const cv::Rect refinedTextRect = tightenTextBandRect(sourceImage, branch == "dot");
+        if (!refinedTextRect.empty() &&
+            (refinedTextRect.width < sourceImage.cols || refinedTextRect.height < sourceImage.rows)) {
+            sourceImage = sourceImage(refinedTextRect).clone();
+            sourcePath = (fs::path(debugDir) / ("5" + std::string(branch == "size" ? "4" : "5") + "_yolo_" + branch + "_tight.png")).string();
+            saveDebugImage(sourceImage, sourcePath);
+        }
+
+        cv::Mat upscaledForOcr = upscaleIfSmall(sourceImage, branch == "dot");
+        if (!upscaledForOcr.empty() &&
+            (upscaledForOcr.cols != sourceImage.cols || upscaledForOcr.rows != sourceImage.rows)) {
+            sourceImage = upscaledForOcr;
+            sourcePath = (fs::path(debugDir) / ("5" + std::string(branch == "size" ? "6" : "7") + "_yolo_" + branch + "_upscaled.png")).string();
+            saveDebugImage(sourceImage, sourcePath);
+        }
+
         field.cropPath = sourcePath;
         field.boundingBox = box;
         field.roiQuality = wheelGeometry.found ? computeAnnulusCompatibility(box, wheelGeometry) : 1.0;
@@ -703,7 +915,12 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     };
 
     const Clock::time_point sizeStart = Clock::now();
-    sizeFromYolo = runYoloBranch("size", bestSizeBox, result.tyreSize, result.tyreSizeFound);
+    for (const auto& candidate : sizeCandidates) {
+        if (runYoloBranch("size", candidate.box, result.tyreSize, result.tyreSizeFound)) {
+            sizeFromYolo = true;
+            break;
+        }
+    }
     if (!sizeFromYolo && !yoloAvailable) {
         result.tyreSize = detectTyreSizeField(ocrSource, debugDir, result);
         if (result.tyreSize.found) {
@@ -714,7 +931,12 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
     appendTiming(result.stepTimings, "size_branch_total_ms", elapsedMs(sizeStart, Clock::now()));
 
     const Clock::time_point dotStart = Clock::now();
-    dotFromYolo = runYoloBranch("dot", bestDotBox, result.dot, result.dotFound);
+    for (const auto& candidate : dotCandidates) {
+        if (runYoloBranch("dot", candidate.box, result.dot, result.dotFound)) {
+            dotFromYolo = true;
+            break;
+        }
+    }
     if (!dotFromYolo && !yoloAvailable) {
         result.dot = detectDotField(ocrSource, debugDir, result);
         if (result.dot.found) {
@@ -727,6 +949,8 @@ AnalysisResult TyreAnalyzer::analyzeFrame(const cv::Mat& frame,
 
     if (skipOcr_) {
         result.notes.push_back("OCR skipped by request after wheel/YOLO/local-unwarp extraction.");
+        const cv::Rect bestSizeBox = sizeCandidates.empty() ? cv::Rect() : sizeCandidates.front().box;
+        const cv::Rect bestDotBox = dotCandidates.empty() ? cv::Rect() : dotCandidates.front().box;
         saveCropOrPlaceholder(frame, bestSizeBox, sizeCropPath, "size ROI prepared", !bestSizeBox.empty());
         saveCropOrPlaceholder(frame, bestDotBox, dotCropPath, "dot ROI prepared", !bestDotBox.empty());
         saveOverlay(frame, overlayBoxes, bestSizeBox, bestDotBox, overlayPath);

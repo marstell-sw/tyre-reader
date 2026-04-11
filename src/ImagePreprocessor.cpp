@@ -3,6 +3,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 
@@ -90,6 +91,172 @@ float refineOuterRadiusFromEdges(const cv::Mat& blurred,
 
 cv::RotatedRect ellipseFromCircle(const cv::Point2f& center, float radius) {
     return cv::RotatedRect(center, cv::Size2f(radius * 2.0F, radius * 2.0F), 0.0F);
+}
+
+struct ComboCircle {
+    cv::Point2f center;
+    float radius = 0.0F;
+    std::vector<cv::Point2f> anchorPoints;
+};
+
+ComboCircle fitCircleLeastSquares(const std::vector<cv::Point2f>& points) {
+    ComboCircle result;
+    if (points.size() < 3) {
+        return result;
+    }
+
+    cv::Mat a(static_cast<int>(points.size()), 3, CV_64F);
+    cv::Mat b(static_cast<int>(points.size()), 1, CV_64F);
+    for (int i = 0; i < static_cast<int>(points.size()); ++i) {
+        const double x = points[static_cast<std::size_t>(i)].x;
+        const double y = points[static_cast<std::size_t>(i)].y;
+        a.at<double>(i, 0) = x;
+        a.at<double>(i, 1) = y;
+        a.at<double>(i, 2) = 1.0;
+        b.at<double>(i, 0) = x * x + y * y;
+    }
+
+    cv::Mat solution;
+    cv::solve(a, b, solution, cv::DECOMP_SVD);
+    const double d = solution.at<double>(0, 0);
+    const double e = solution.at<double>(1, 0);
+    const double f = solution.at<double>(2, 0);
+    const double cx = d * 0.5;
+    const double cy = e * 0.5;
+    const double radius = std::sqrt(std::max(0.0, f + cx * cx + cy * cy));
+
+    result.center = cv::Point2f(static_cast<float>(cx), static_cast<float>(cy));
+    result.radius = static_cast<float>(radius);
+    result.anchorPoints.assign(points.begin(), points.end());
+    return result;
+}
+
+ComboCircle findInnerFromBorders(const cv::Mat& gray) {
+    ComboCircle result;
+    if (gray.empty()) {
+        return result;
+    }
+
+    const int h = gray.rows;
+    const int w = gray.cols;
+    struct ScanSpec { int sx; int sy; int dx; int dy; };
+    const std::array<ScanSpec, 4> scans{{
+        {w / 2, 0, 0, 1},
+        {w / 2, h - 1, 0, -1},
+        {0, h / 2, 1, 0},
+        {w - 1, h / 2, -1, 0},
+    }};
+
+    std::vector<cv::Point2f> points;
+    for (const auto& scan : scans) {
+        std::vector<float> values;
+        std::vector<cv::Point2f> coords;
+        int x = scan.sx;
+        int y = scan.sy;
+        while (x >= 0 && x < w && y >= 0 && y < h) {
+            values.push_back(static_cast<float>(gray.at<std::uint8_t>(y, x)));
+            coords.emplace_back(static_cast<float>(x), static_cast<float>(y));
+            x += scan.dx;
+            y += scan.dy;
+        }
+
+        if (values.size() < 50) {
+            continue;
+        }
+
+        std::vector<float> smooth(values.size(), 0.0F);
+        const int radius = 7;
+        for (int i = 0; i < static_cast<int>(values.size()); ++i) {
+            float acc = 0.0F;
+            int count = 0;
+            for (int k = -radius; k <= radius; ++k) {
+                const int idx = i + k;
+                if (idx < 0 || idx >= static_cast<int>(values.size())) {
+                    continue;
+                }
+                acc += values[static_cast<std::size_t>(idx)];
+                ++count;
+            }
+            smooth[static_cast<std::size_t>(i)] = count > 0 ? acc / static_cast<float>(count) : values[static_cast<std::size_t>(i)];
+        }
+
+        bool inTire = false;
+        for (int i = 0; i < static_cast<int>(smooth.size()); ++i) {
+            const float value = smooth[static_cast<std::size_t>(i)];
+            if (value > 80.0F) {
+                inTire = true;
+            }
+            if (inTire && value < 50.0F) {
+                points.push_back(coords[static_cast<std::size_t>(i)]);
+                break;
+            }
+        }
+    }
+
+    return fitCircleLeastSquares(points);
+}
+
+float findOuterRadialCombo(const cv::Mat& gray, int cx, int cy) {
+    if (gray.empty()) {
+        return 0.0F;
+    }
+
+    const int h = gray.rows;
+    const int w = gray.cols;
+    const int maxRadius = std::min({cx, cy, w - cx, h - cy}) - 10;
+    if (maxRadius < 120) {
+        return 0.0F;
+    }
+
+    std::vector<int> radii;
+    for (int i = 0; i < 360; ++i) {
+        const double angle = 2.0 * CV_PI * static_cast<double>(i) / 360.0;
+        std::vector<int> rr;
+        std::vector<float> values;
+        for (int radius = 10; radius < maxRadius; radius += 2) {
+            const int x = cvRound(static_cast<double>(cx) + static_cast<double>(radius) * std::cos(angle));
+            const int y = cvRound(static_cast<double>(cy) + static_cast<double>(radius) * std::sin(angle));
+            if (x < 0 || x >= w || y < 0 || y >= h) {
+                continue;
+            }
+            rr.push_back(radius);
+            values.push_back(static_cast<float>(gray.at<std::uint8_t>(y, x)));
+        }
+        if (values.size() < 20) {
+            continue;
+        }
+
+        std::vector<float> smooth(values.size(), 0.0F);
+        const int kernelRadius = 3;
+        for (int j = 0; j < static_cast<int>(values.size()); ++j) {
+            float acc = 0.0F;
+            int count = 0;
+            for (int k = -kernelRadius; k <= kernelRadius; ++k) {
+                const int idx = j + k;
+                if (idx < 0 || idx >= static_cast<int>(values.size())) {
+                    continue;
+                }
+                acc += values[static_cast<std::size_t>(idx)];
+                ++count;
+            }
+            smooth[static_cast<std::size_t>(j)] = count > 0 ? acc / static_cast<float>(count) : values[static_cast<std::size_t>(j)];
+        }
+
+        for (int j = static_cast<int>(smooth.size()) - 2; j > 0; --j) {
+            const float grad = smooth[static_cast<std::size_t>(j + 1)] - smooth[static_cast<std::size_t>(j)];
+            if (grad < -10.0F && rr[static_cast<std::size_t>(j)] > 100) {
+                radii.push_back(rr[static_cast<std::size_t>(j)]);
+                break;
+            }
+        }
+    }
+
+    if (radii.empty()) {
+        return 0.0F;
+    }
+    const auto mid = radii.begin() + static_cast<std::ptrdiff_t>(radii.size() / 2);
+    std::nth_element(radii.begin(), mid, radii.end());
+    return static_cast<float>(*mid);
 }
 
 cv::RotatedRect fitBestOuterEllipse(const std::vector<std::vector<cv::Point>>& contours,
@@ -524,6 +691,23 @@ ImagePreprocessor::WheelGeometry ImagePreprocessor::detectWheelGeometry(
 
     std::vector<std::vector<cv::Point>> holeContours;
     cv::findContours(holeMask, holeContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    const ComboCircle comboInner = findInnerFromBorders(blurred);
+    if (comboInner.radius > minDim * 0.18F && comboInner.radius < minDim * 0.48F) {
+        const float comboOuterRadius = findOuterRadialCombo(blurred, cvRound(comboInner.center.x), cvRound(comboInner.center.y));
+        if (comboOuterRadius > comboInner.radius + 40.0F) {
+            bestScore = 20.0;
+            bestCenter = comboInner.center;
+            bestHoleRadius = comboInner.radius;
+            bestRadius = comboOuterRadius;
+            bestInnerEllipse = ellipseFromCircle(comboInner.center, comboInner.radius);
+            bestRect = cv::Rect(cvRound(bestCenter.x - bestRadius),
+                                cvRound(bestCenter.y - bestRadius),
+                                cvRound(bestRadius * 2.0F),
+                                cvRound(bestRadius * 2.0F));
+            bestContourIndex = -1;
+        }
+    }
 
     cv::Point2f isolatedCenter;
     float isolatedHoleRadius = 0.0F;
